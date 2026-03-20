@@ -136,20 +136,20 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
       tmpPos.fromBufferAttribute(posAttr, t + v);
       const k = posKey(tmpPos.x, tmpPos.y, tmpPos.z);
       if (userExcluded && excludedPosSet) excludedPosSet.add(k);
-      // Use the geometric face normal (faceNrm = cross product, length ∝ 2×area)
-      // instead of the buffer normal.  The subdivision pipeline interpolates
-      // smooth normals at midpoints, which propagates the 45° edge tilt deep
-      // into the face interior across iterations.  Using the true face normal
-      // ensures interior vertices on flat faces get a perfectly perpendicular
-      // smooth normal, limiting the angled displacement to the single outermost
-      // vertex row at each hard edge — matching addSmoothNormals() in main.js.
+      // Use the buffer normal (from subdivision) weighted by face area.
+      // The subdivision pipeline splits indexed vertices at sharp dihedral
+      // edges (>30°), so the interpolated buffer normals are smooth across
+      // soft edges (cylinder, sphere) but sharp across hard edges (cube).
+      // This eliminates visible faceting steps on round surfaces while still
+      // preserving hard edges.
+      tmpNrm.fromBufferAttribute(nrmAttr, t + v);
       const existing = smoothNrmMap.get(k);
       if (existing) {
-        existing[0] += faceNrm.x;
-        existing[1] += faceNrm.y;
-        existing[2] += faceNrm.z;
+        existing[0] += tmpNrm.x * faceArea;
+        existing[1] += tmpNrm.y * faceArea;
+        existing[2] += tmpNrm.z * faceArea;
       } else {
-        smoothNrmMap.set(k, [faceNrm.x, faceNrm.y, faceNrm.z]);
+        smoothNrmMap.set(k, [tmpNrm.x * faceArea, tmpNrm.y * faceArea, tmpNrm.z * faceArea]);
       }
       if (czX > 1e-12 || czY > 1e-12 || czZ > 1e-12) {
         const za = zoneAreaMap.get(k);

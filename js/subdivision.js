@@ -88,6 +88,17 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   const maxSq = maxEdgeLength * maxEdgeLength;
   const midCache = new Map();
 
+  // Position-based edge key for split detection.  toIndexed() splits indexed
+  // vertices at sharp dihedral edges (>30°), so two faces sharing a geometric
+  // edge may reference different index pairs.  Using quantised positions as
+  // the key guarantees both sides see the same split decision, preventing
+  // T-junctions at the boundary between textured and angle-masked faces.
+  const _posEdgeKey = (a, b) => {
+    const ka = `${Math.round(positions[a*3]*QUANTISE)}_${Math.round(positions[a*3+1]*QUANTISE)}_${Math.round(positions[a*3+2]*QUANTISE)}`;
+    const kb = `${Math.round(positions[b*3]*QUANTISE)}_${Math.round(positions[b*3+1]*QUANTISE)}_${Math.round(positions[b*3+2]*QUANTISE)}`;
+    return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+  };
+
   // ── Step 1: globally mark edges that need splitting ─────────────────────
   // Excluded triangles do NOT proactively mark their own edges – their
   // interior edges will never be split, saving triangles on untextured
@@ -97,9 +108,9 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
   for (let t = 0; t < indices.length; t += 3) {
     if (faceExcluded && faceExcluded[t / 3]) continue; // skip excluded faces
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
-    if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(edgeKey(a, b));
-    if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(edgeKey(b, c));
-    if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(edgeKey(c, a));
+    if (edgeLenSq(positions, a, b) > maxSq) splitEdges.add(_posEdgeKey(a, b));
+    if (edgeLenSq(positions, b, c) > maxSq) splitEdges.add(_posEdgeKey(b, c));
+    if (edgeLenSq(positions, c, a) > maxSq) splitEdges.add(_posEdgeKey(c, a));
   }
 
   if (splitEdges.size === 0) return { newIndices: indices, newFaceExcluded: faceExcluded, changed: false };
@@ -122,9 +133,9 @@ function subdividePass(positions, normals, weights, indices, maxEdgeLength, safe
     const a = indices[t], b = indices[t + 1], c = indices[t + 2];
     const fIdx = t / 3;
     const excl = faceExcluded ? faceExcluded[fIdx] : 0;
-    const sAB = splitEdges.has(edgeKey(a, b));
-    const sBC = splitEdges.has(edgeKey(b, c));
-    const sCA = splitEdges.has(edgeKey(c, a));
+    const sAB = splitEdges.has(_posEdgeKey(a, b));
+    const sBC = splitEdges.has(_posEdgeKey(b, c));
+    const sCA = splitEdges.has(_posEdgeKey(c, a));
     const n   = (sAB ? 1 : 0) + (sBC ? 1 : 0) + (sCA ? 1 : 0);
 
     if (n === 0) {
@@ -258,43 +269,93 @@ function getMidpoint(positions, normals, weights, cache, a, b) {
 // weight wins (conservative: any excluded face marks the shared vertex).
 function toIndexed(geometry, nonIndexedWeights = null) {
   const posAttr = geometry.attributes.position;
-  const nrmAttr = geometry.attributes.normal;
-
-  const positions = [];
-  const normals   = [];
-  const normalSums = [];
-  const weights   = nonIndexedWeights ? [] : null;
-  const indices   = [];
-  const vertMap   = new Map();
-
   const n = posAttr.count;
+
+  // ── Pre-compute per-face normals (unit + raw cross product) ──────────────
+  const faceNrmUnit = new Float32Array(n * 3);
+  const faceNrmRaw  = new Float32Array(n * 3);
+  for (let t = 0; t < n; t += 3) {
+    const ax = posAttr.getX(t),   ay = posAttr.getY(t),   az = posAttr.getZ(t);
+    const bx = posAttr.getX(t+1), by = posAttr.getY(t+1), bz = posAttr.getZ(t+1);
+    const cx = posAttr.getX(t+2), cy = posAttr.getY(t+2), cz = posAttr.getZ(t+2);
+    const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
+    const e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
+    const rx = e1y*e2z - e1z*e2y;
+    const ry = e1z*e2x - e1x*e2z;
+    const rz = e1x*e2y - e1y*e2x;
+    const len = Math.sqrt(rx*rx + ry*ry + rz*rz) || 1;
+    const ux = rx/len, uy = ry/len, uz = rz/len;
+    for (let v = 0; v < 3; v++) {
+      faceNrmUnit[(t+v)*3]   = ux;
+      faceNrmUnit[(t+v)*3+1] = uy;
+      faceNrmUnit[(t+v)*3+2] = uz;
+      faceNrmRaw[(t+v)*3]    = rx;
+      faceNrmRaw[(t+v)*3+1]  = ry;
+      faceNrmRaw[(t+v)*3+2]  = rz;
+    }
+  }
+
+  // ── Merge vertices, splitting at sharp dihedral edges ───────────────────
+  // Two vertices at the same position merge into one indexed vertex only when
+  // their face normals are within SHARP_ANGLE of each other.  This keeps
+  // smooth-surface normals averaged across facet boundaries (cylinder, sphere)
+  // while preventing the 45° edge-normal tilt from propagating into flat-face
+  // interiors during subdivision (cube, box).
+  const SHARP_COS = Math.cos(30 * Math.PI / 180);
+
+  const positions  = [];
+  const normals    = [];
+  const normalSums = [];
+  const weights    = nonIndexedWeights ? [] : null;
+  const indices    = [];
+  const vertMap    = new Map(); // posKey → [{idx, fnU: [x,y,z]}]
+
   for (let i = 0; i < n; i++) {
     const px = posAttr.getX(i);
     const py = posAttr.getY(i);
     const pz = posAttr.getZ(i);
-    const nx_ = nrmAttr ? nrmAttr.getX(i) : 0;
-    const ny_ = nrmAttr ? nrmAttr.getY(i) : 0;
-    const nz_ = nrmAttr ? nrmAttr.getZ(i) : 1;
+    const fnUx = faceNrmUnit[i*3], fnUy = faceNrmUnit[i*3+1], fnUz = faceNrmUnit[i*3+2];
+    const fnRx = faceNrmRaw[i*3],  fnRy = faceNrmRaw[i*3+1],  fnRz = faceNrmRaw[i*3+2];
 
     const key = `${Math.round(px * QUANTISE)}_${Math.round(py * QUANTISE)}_${Math.round(pz * QUANTISE)}`;
-    let idx = vertMap.get(key);
-    if (idx === undefined) {
-      idx = positions.length / 3;
-      positions.push(px, py, pz);
-      normals.push(nx_, ny_, nz_);
-      normalSums.push(nx_, ny_, nz_);
-      if (weights) weights.push(nonIndexedWeights[i]);
-      vertMap.set(key, idx);
-    } else {
-      normalSums[idx * 3]     += nx_;
-      normalSums[idx * 3 + 1] += ny_;
-      normalSums[idx * 3 + 2] += nz_;
-      if (weights && nonIndexedWeights[i] > weights[idx]) {
-        // MAX: if any incident original face was excluded, the shared vertex is excluded
-        weights[idx] = nonIndexedWeights[i];
+    const clusters = vertMap.get(key);
+    if (clusters) {
+      let matched = false;
+      for (const cl of clusters) {
+        const dot = cl.fnU[0]*fnUx + cl.fnU[1]*fnUy + cl.fnU[2]*fnUz;
+        if (dot >= SHARP_COS) {
+          // Same smooth group – accumulate area-weighted face normal
+          const idx = cl.idx;
+          normalSums[idx*3]   += fnRx;
+          normalSums[idx*3+1] += fnRy;
+          normalSums[idx*3+2] += fnRz;
+          if (weights && nonIndexedWeights[i] > weights[idx]) {
+            weights[idx] = nonIndexedWeights[i];
+          }
+          indices.push(idx);
+          matched = true;
+          break;
+        }
       }
+      if (!matched) {
+        // New cluster at this position (sharp-edge split)
+        const idx = positions.length / 3;
+        positions.push(px, py, pz);
+        normals.push(fnRx, fnRy, fnRz);
+        normalSums.push(fnRx, fnRy, fnRz);
+        if (weights) weights.push(nonIndexedWeights[i]);
+        clusters.push({idx, fnU: [fnUx, fnUy, fnUz]});
+        indices.push(idx);
+      }
+    } else {
+      const idx = positions.length / 3;
+      positions.push(px, py, pz);
+      normals.push(fnRx, fnRy, fnRz);
+      normalSums.push(fnRx, fnRy, fnRz);
+      if (weights) weights.push(nonIndexedWeights[i]);
+      vertMap.set(key, [{idx, fnU: [fnUx, fnUy, fnUz]}]);
+      indices.push(idx);
     }
-    indices.push(idx);
   }
 
   for (let i = 0; i < positions.length / 3; i++) {

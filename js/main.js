@@ -1132,8 +1132,14 @@ function addSmoothNormals(geometry) {
   const key = (x, y, z) =>
     `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
 
-  // Accumulate area-weighted face normals per unique position
+  // Accumulate area-weighted buffer normals per unique position.
+  // The subdivision pipeline splits indexed vertices at sharp dihedral edges
+  // (>30°) so the interpolated buffer normals are smooth across soft edges
+  // (cylinder, sphere) but sharp across hard edges (cube).  Using these buffer
+  // normals instead of geometric face normals eliminates visible faceting steps
+  // on round surfaces while still preserving hard edges.
   const nrmMap = new Map();
+  const nrm = geometry.attributes.normal.array;
   const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
   const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
 
@@ -1143,19 +1149,20 @@ function addSmoothNormals(geometry) {
     vC.set(pos[(i + 2) * 3], pos[(i + 2) * 3 + 1], pos[(i + 2) * 3 + 2]);
     e1.subVectors(vB, vA);
     e2.subVectors(vC, vA);
-    fn.crossVectors(e1, e2); // length = 2 × triangle area
+    fn.crossVectors(e1, e2);
     const area = fn.length();
     if (area < 1e-12) continue;
-    fn.divideScalar(area); // unit face normal
-    for (const v of [vA, vB, vC]) {
-      const k = key(v.x, v.y, v.z);
+    for (let v = 0; v < 3; v++) {
+      const vi = i + v;
+      const nx = nrm[vi * 3], ny = nrm[vi * 3 + 1], nz = nrm[vi * 3 + 2];
+      const k = key(pos[vi * 3], pos[vi * 3 + 1], pos[vi * 3 + 2]);
       const prev = nrmMap.get(k);
       if (prev) {
-        prev[0] += fn.x * area;
-        prev[1] += fn.y * area;
-        prev[2] += fn.z * area;
+        prev[0] += nx * area;
+        prev[1] += ny * area;
+        prev[2] += nz * area;
       } else {
-        nrmMap.set(k, [fn.x * area, fn.y * area, fn.z * area]);
+        nrmMap.set(k, [nx * area, ny * area, nz * area]);
       }
     }
   }
