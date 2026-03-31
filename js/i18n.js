@@ -53,8 +53,10 @@ export const TRANSLATIONS = {
     // Seam blend
     'labels.seamBlend':              'Seam Blend \u24d8',
     'tooltips.seamBlend':            'Softens the hard seam where projection faces meet. Effective for Cubic and Cylindrical modes.',
-    'labels.smoothing':              'Smoothing \u24d8',
-    'tooltips.smoothing':            'Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.',
+    'labels.transitionSmoothing':    'Transition Smoothing \u24d8',
+    'tooltips.transitionSmoothing':  'Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.',
+    'labels.textureSmoothing':       'Texture Smoothing \u24d8',
+    'tooltips.textureSmoothing':     'Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.',
     'labels.capAngle':               'Cap Angle \u24d8',
     'tooltips.capAngle':             'Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.',
 
@@ -209,8 +211,10 @@ export const TRANSLATIONS = {
     // Seam blend
     'labels.seamBlend':              'Nahtglättung \u24d8',
     'tooltips.seamBlend':            'Glättet den scharfen Übergang zwischen Projektionsflächen. Wirksam für Kubische und Zylindrische Modi.',
-    'labels.smoothing':              'Glättung \u24d8',
-    'tooltips.smoothing':            'Breite der Übergangszone an Nahtkanten. Niedrige Werte halten den Übergang nah an der Naht; höhere Werte glätten einen breiteren Bereich.',
+    'labels.transitionSmoothing':    'Übergangsglättung \u24d8',
+    'tooltips.transitionSmoothing':  'Breite der Übergangszone an Nahtkanten. Niedrige Werte halten den Übergang nah an der Naht; höhere Werte glätten einen breiteren Bereich.',
+    'labels.textureSmoothing':       'Texturglättung \u24d8',
+    'tooltips.textureSmoothing':     'Wendet einen Gaußschen Weichzeichner auf die Verschiebungskarte an. Höhere Werte erzeugen weichere, fließendere Oberflächendetails. 0 = aus.',
     'labels.capAngle':               'Übergangswinkel \u24d8',
     'tooltips.capAngle':             'Winkel (in Grad) ab dem die Deckel-/Bodenprojektion einsetzt. Kleinere Werte beschränken die Deckelprojektion auf nahezu flache Flächen.',
 

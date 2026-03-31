@@ -53,6 +53,7 @@ const settings = {
   topAngleLimit:    0,
   mappingBlend:     1,
   seamBandWidth:    0.5,
+  textureSmoothing: 0,
   capAngle:         20,
   symmetricDisplacement: false,
   useDisplacement: false,
@@ -112,6 +113,8 @@ const seamBlendSlider        = document.getElementById('seam-blend');
 const seamBlendVal           = document.getElementById('seam-blend-val');
 const seamBandWidthSlider    = document.getElementById('seam-band-width');
 const seamBandWidthVal       = document.getElementById('seam-band-width-val');
+const textureSmoothingSlider = document.getElementById('texture-smoothing');
+const textureSmoothingVal    = document.getElementById('texture-smoothing-val');
 const capAngleSlider         = document.getElementById('cap-angle');
 const capAngleVal            = document.getElementById('cap-angle-val');
 const capAngleRow            = document.getElementById('cap-angle-row');
@@ -215,11 +218,18 @@ function buildPresetGrid() {
   });
 }
 
+function resetTextureSmoothing() {
+  settings.textureSmoothing = 0;
+  textureSmoothingSlider.value = 0;
+  textureSmoothingVal.value    = 0;
+}
+
 function selectPreset(idx, swatchEl) {
   document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
   swatchEl.classList.add('active');
   activeMapEntry = PRESETS[idx];
   activeMapName.textContent = PRESETS[idx].name;
+  resetTextureSmoothing();
   updatePreview();
 }
 
@@ -274,6 +284,7 @@ function wireEvents() {
       activeMapEntry.isCustom = true;
       activeMapName.textContent = file.name;
       document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
+      resetTextureSmoothing();
       updatePreview();
     } catch (err) {
       console.error('Failed to load texture:', err);
@@ -337,6 +348,7 @@ function wireEvents() {
   linkSlider(topAngleLimitSlider,    topAngleLimitVal,    v => { settings.topAngleLimit    = v; return v; });
   linkSlider(seamBlendSlider,        seamBlendVal,        v => { settings.mappingBlend     = v; return v.toFixed(2); });
   linkSlider(seamBandWidthSlider,    seamBandWidthVal,    v => { settings.seamBandWidth    = v; return v.toFixed(2); });
+  linkSlider(textureSmoothingSlider, textureSmoothingVal, v => { settings.textureSmoothing = v; return v.toFixed(1); });
   linkSlider(capAngleSlider,          capAngleVal,          v => { settings.capAngle         = v; return Math.round(v); });
   symmetricDispToggle.addEventListener('change', () => {
     settings.symmetricDisplacement = symmetricDispToggle.checked;
@@ -1299,6 +1311,38 @@ function buildParentFaceMap(subdivGeo) {
   return parentMap;
 }
 
+function getEffectiveMapEntry() {
+  if (!activeMapEntry || settings.textureSmoothing === 0) return activeMapEntry;
+  const { fullCanvas, width, height } = activeMapEntry;
+  // Tile the source 3×3 before blurring so edge pixels have correct
+  // neighbours and the blurred centre tile is seamlessly tileable.
+  const tiled = document.createElement('canvas');
+  tiled.width  = width  * 3;
+  tiled.height = height * 3;
+  const tc = tiled.getContext('2d');
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+      tc.drawImage(fullCanvas, col * width, row * height);
+    }
+  }
+  // Blur the 3×3 canvas, then crop out only the centre tile.
+  const blurred = document.createElement('canvas');
+  blurred.width  = width  * 3;
+  blurred.height = height * 3;
+  const bc = blurred.getContext('2d');
+  bc.filter = `blur(${settings.textureSmoothing}px)`;
+  bc.drawImage(tiled, 0, 0);
+  bc.filter = 'none';
+  const offscreen = document.createElement('canvas');
+  offscreen.width  = width;
+  offscreen.height = height;
+  offscreen.getContext('2d').drawImage(blurred, width, height, width, height, 0, 0, width, height);
+  const imageData = offscreen.getContext('2d').getImageData(0, 0, width, height);
+  const texture   = new THREE.CanvasTexture(offscreen);
+  texture.wrapS   = texture.wrapT = THREE.RepeatWrapping;
+  return { ...activeMapEntry, imageData, texture };
+}
+
 function updatePreview() {
   if (!currentGeometry || !currentBounds) return;
 
@@ -1323,11 +1367,13 @@ function updatePreview() {
   // Ensure faceMask attribute is current before rendering
   updateFaceMask(activeGeo);
 
+  const effectiveEntry = getEffectiveMapEntry();
+
   if (!previewMaterial) {
-    previewMaterial = createPreviewMaterial(activeMapEntry.texture, fullSettings);
+    previewMaterial = createPreviewMaterial(effectiveEntry.texture, fullSettings);
     loadGeometry(activeGeo, previewMaterial);
   } else {
-    updateMaterial(previewMaterial, activeMapEntry.texture, fullSettings);
+    updateMaterial(previewMaterial, effectiveEntry.texture, fullSettings);
   }
 
   exportBtn.disabled = false;
@@ -1447,7 +1493,7 @@ async function toggleDisplacementPreview(enable) {
   if (!enable) {
     // Revert to original geometry with bump-only shading.
     if (currentGeometry && previewMaterial) {
-      updateMaterial(previewMaterial, activeMapEntry?.texture, { ...settings, bounds: currentBounds });
+      updateMaterial(previewMaterial, getEffectiveMapEntry()?.texture, { ...settings, bounds: currentBounds });
       updateFaceMask(currentGeometry);
       setMeshGeometry(currentGeometry);
     }
@@ -1499,7 +1545,7 @@ async function toggleDisplacementPreview(enable) {
       previewMaterial = null;
     }
     const fullSettings = { ...settings, bounds: currentBounds };
-    previewMaterial = createPreviewMaterial(activeMapEntry.texture, fullSettings);
+    previewMaterial = createPreviewMaterial(getEffectiveMapEntry().texture, fullSettings);
     setMeshGeometry(dispPreviewGeometry);
     setMeshMaterial(previewMaterial);
 
@@ -1585,12 +1631,13 @@ async function handleExport() {
     const subTriCount = subdivided.attributes.position.count / 3;
     setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
 
+    const exportEntry = getEffectiveMapEntry();
     const displaced = await runAsync(() =>
       applyDisplacement(
         subdivided,
-        activeMapEntry.imageData,
-        activeMapEntry.width,
-        activeMapEntry.height,
+        exportEntry.imageData,
+        exportEntry.width,
+        exportEntry.height,
         settings,
         currentBounds,
         (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
