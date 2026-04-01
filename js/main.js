@@ -59,6 +59,83 @@ const settings = {
   useDisplacement: false,
 };
 
+// ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
+const CANVAS_FILTER_SUPPORTED = (() => {
+  try {
+    const ctx = document.createElement('canvas').getContext('2d');
+    ctx.filter = 'blur(1px)';
+    return ctx.filter === 'blur(1px)';
+  } catch (e) { return false; }
+})();
+
+/**
+ * Box-blur one row of RGBA pixels (horizontal pass).
+ * Operates in-place reading from `src` and writing to `dst`.
+ */
+function _boxBlurH(src, dst, w, h, r) {
+  const iarr = 1 / (2 * r + 1);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let ch = 0; ch < 4; ch++) {
+      let val = 0;
+      // Seed with left-edge pixel repeated r+1 times plus the first r pixels
+      for (let x = -r; x <= r; x++) val += src[(row + Math.max(0, Math.min(x, w - 1))) * 4 + ch];
+      for (let x = 0; x < w; x++) {
+        val += src[(row + Math.min(x + r, w - 1)) * 4 + ch]
+             - src[(row + Math.max(x - r - 1, 0)) * 4 + ch];
+        dst[(row + x) * 4 + ch] = Math.round(val * iarr);
+      }
+    }
+  }
+}
+
+/** Box-blur one column of RGBA pixels (vertical pass). */
+function _boxBlurV(src, dst, w, h, r) {
+  const iarr = 1 / (2 * r + 1);
+  for (let x = 0; x < w; x++) {
+    for (let ch = 0; ch < 4; ch++) {
+      let val = 0;
+      for (let y = -r; y <= r; y++) val += src[(Math.max(0, Math.min(y, h - 1)) * w + x) * 4 + ch];
+      for (let y = 0; y < h; y++) {
+        val += src[(Math.min(y + r, h - 1) * w + x) * 4 + ch]
+             - src[(Math.max(y - r - 1, 0) * w + x) * 4 + ch];
+        dst[(y * w + x) * 4 + ch] = Math.round(val * iarr);
+      }
+    }
+  }
+}
+
+/**
+ * Apply an approximate Gaussian blur (sigma px) to `canvas` in-place.
+ * Uses the native CSS filter on Chrome/Firefox; falls back to a 3-pass
+ * separable box blur for Safari / iOS WebKit.
+ */
+function blurCanvas(canvas, sigma) {
+  if (sigma <= 0) return;
+  if (CANVAS_FILTER_SUPPORTED) {
+    const tmp = document.createElement('canvas');
+    tmp.width = canvas.width; tmp.height = canvas.height;
+    const tc = tmp.getContext('2d');
+    tc.filter = `blur(${sigma}px)`;
+    tc.drawImage(canvas, 0, 0);
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    canvas.getContext('2d').drawImage(tmp, 0, 0);
+  } else {
+    // 3 passes of box blur ≈ Gaussian; radius r where r(r+1) ≈ sigma²
+    const r = Math.max(1, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2));
+    const ctx = canvas.getContext('2d');
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const a = imgData.data;
+    const b = new Uint8ClampedArray(a.length);
+    const w = canvas.width, h = canvas.height;
+    for (let pass = 0; pass < 3; pass++) {
+      _boxBlurH(a, b, w, h, r);
+      _boxBlurV(b, a, w, h, r);
+    }
+    ctx.putImageData(imgData, 0, 0);
+  }
+}
+
 // ── Displacement preview state ────────────────────────────────────────────────
 let dispPreviewGeometry  = null;   // subdivided geometry with smoothNormal attribute
 let dispPreviewBusy      = false;  // true while async subdivision is running
@@ -1332,10 +1409,8 @@ function getEffectiveMapEntry() {
   const blurred = document.createElement('canvas');
   blurred.width  = width  * 3;
   blurred.height = height * 3;
-  const bc = blurred.getContext('2d');
-  bc.filter = `blur(${settings.textureSmoothing}px)`;
-  bc.drawImage(tiled, 0, 0);
-  bc.filter = 'none';
+  blurred.getContext('2d').drawImage(tiled, 0, 0);
+  blurCanvas(blurred, settings.textureSmoothing);
   const offscreen = document.createElement('canvas');
   offscreen.width  = width;
   offscreen.height = height;
