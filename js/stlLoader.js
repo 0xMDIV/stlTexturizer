@@ -3,6 +3,8 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { unzipSync } from 'fflate';
 import * as THREE from 'three';
 
+const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
+
 const stlLoader = new STLLoader();
 const objLoader = new OBJLoader();
 
@@ -12,6 +14,11 @@ const objLoader = new OBJLoader();
  * The geometry is translated so its bounding-box centre is at the world origin.
  */
 export function loadSTLFile(file) {
+  if (file.size > MAX_FILE_SIZE) {
+    return Promise.reject(new Error(
+      'File too large (' + Math.round(file.size / 1024 / 1024) + ' MB). Maximum supported: ' + (MAX_FILE_SIZE / 1024 / 1024) + ' MB.'
+    ));
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -73,6 +80,11 @@ export function getTriangleCount(geometry) {
  * Returns { geometry, bounds }.
  */
 export function loadOBJFile(file) {
+  if (file.size > MAX_FILE_SIZE) {
+    return Promise.reject(new Error(
+      'File too large (' + Math.round(file.size / 1024 / 1024) + ' MB). Maximum supported: ' + (MAX_FILE_SIZE / 1024 / 1024) + ' MB.'
+    ));
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -99,6 +111,11 @@ export function loadOBJFile(file) {
  * Returns { geometry, bounds }.
  */
 export function load3MFFile(file) {
+  if (file.size > MAX_FILE_SIZE) {
+    return Promise.reject(new Error(
+      'File too large (' + Math.round(file.size / 1024 / 1024) + ' MB). Maximum supported: ' + (MAX_FILE_SIZE / 1024 / 1024) + ' MB.'
+    ));
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -168,6 +185,13 @@ function parse3MF(data) {
         triangles[i * 3]     = parseInt(triEls[i].getAttribute('v1'), 10);
         triangles[i * 3 + 1] = parseInt(triEls[i].getAttribute('v2'), 10);
         triangles[i * 3 + 2] = parseInt(triEls[i].getAttribute('v3'), 10);
+      }
+
+      const vertCount = vertEls.length;
+      for (let i = 0; i < triangles.length; i++) {
+        if (triangles[i] < 0 || triangles[i] >= vertCount || isNaN(triangles[i])) {
+          throw new Error('Invalid triangle index in 3MF file');
+        }
       }
 
       // Normalise path for lookup (strip leading slash, use forward slashes)

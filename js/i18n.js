@@ -81,7 +81,7 @@ export const TRANSLATIONS = {
     'excl.toolBrushTitle':           'Brush: paint triangles to exclude',
     'excl.toolFill':                 'Fill',
     'excl.toolFillTitle':            'Bucket fill: flood-fill surface up to a threshold angle',
-    'excl.shiftHint':                'Hold Shift to erase',
+    'excl.shiftHint':                'Shift: erase \u00b7 Ctrl+click: straight line',
     'labels.type':                   'Type',
     'brushType.single':              'Single',
     'brushType.circle':              'Circle',
@@ -185,6 +185,7 @@ export const TRANSLATIONS = {
     // Alerts
     'alerts.loadFailed':   'Could not load model: {msg}',
     'alerts.exportFailed': 'Export failed: {msg}',
+    'alerts.fileTooLarge': 'File too large ({size} MB). Maximum: {max} MB.',
   },
 
   de: {
@@ -266,7 +267,7 @@ export const TRANSLATIONS = {
     'excl.toolBrushTitle':           'Pinsel: Dreiecke zum Ausschlie\u00dfen einf\u00e4rben',
     'excl.toolFill':                 'F\u00fcllen',
     'excl.toolFillTitle':            'F\u00fcllen: Fl\u00e4che bis zu einem Winkel fluten',
-    'excl.shiftHint':                'Shift gedr\u00fcckt halten zum Radieren',
+    'excl.shiftHint':                'Shift: Radieren \u00b7 Strg+Klick: Gerade Linie',
     'labels.type':                   'Typ',
     'brushType.single':              'Einzeln',
     'brushType.circle':              'Kreis',
@@ -370,6 +371,7 @@ export const TRANSLATIONS = {
     // Alerts
     'alerts.loadFailed':   'Modell konnte nicht geladen werden: {msg}',
     'alerts.exportFailed': 'Export fehlgeschlagen: {msg}',
+    'alerts.fileTooLarge': 'Datei zu gross ({size} MB). Maximum: {max} MB.',
   },
 };
 

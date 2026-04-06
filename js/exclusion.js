@@ -160,24 +160,44 @@ export function buildExclusionOverlayGeo(geometry, faceSet, invert = false) {
   const srcPos   = geometry.attributes.position.array;
   const srcNrm   = geometry.attributes.normal ? geometry.attributes.normal.array : null;
   const total    = srcPos.length / 9; // total triangle count
-  const count    = invert ? total - faceSet.size : faceSet.size;
+  const isArr    = faceSet instanceof Uint8Array;
+
+  // Count included faces
+  let setSize;
+  if (isArr) {
+    setSize = 0;
+    for (let i = 0; i < faceSet.length; i++) if (faceSet[i]) setSize++;
+  } else {
+    setSize = faceSet.size;
+  }
+  const count    = invert ? total - setSize : setSize;
   const outPos   = new Float32Array(count * 9);
   const outNrm   = srcNrm ? new Float32Array(count * 9) : null;
   let dst = 0;
   if (invert) {
     for (let t = 0; t < total; t++) {
-      if (faceSet.has(t)) continue;
+      if (isArr ? faceSet[t] : faceSet.has(t)) continue;
       const src = t * 9;
       outPos.set(srcPos.subarray(src, src + 9), dst);
       if (outNrm) outNrm.set(srcNrm.subarray(src, src + 9), dst);
       dst += 9;
     }
   } else {
-    for (const t of faceSet) {
-      const src = t * 9;
-      outPos.set(srcPos.subarray(src, src + 9), dst);
-      if (outNrm) outNrm.set(srcNrm.subarray(src, src + 9), dst);
-      dst += 9;
+    if (isArr) {
+      for (let t = 0; t < faceSet.length; t++) {
+        if (!faceSet[t]) continue;
+        const src = t * 9;
+        outPos.set(srcPos.subarray(src, src + 9), dst);
+        if (outNrm) outNrm.set(srcNrm.subarray(src, src + 9), dst);
+        dst += 9;
+      }
+    } else {
+      for (const t of faceSet) {
+        const src = t * 9;
+        outPos.set(srcPos.subarray(src, src + 9), dst);
+        if (outNrm) outNrm.set(srcNrm.subarray(src, src + 9), dst);
+        dst += 9;
+      }
     }
   }
   const geo = new THREE.BufferGeometry();

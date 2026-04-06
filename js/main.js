@@ -39,6 +39,8 @@ let selectionMode      = false;       // false = exclude painted faces; true = i
 let _lastHoverTriIdx   = -1;          // last triangle index used for hover preview
 let placeOnFaceActive  = false;       // true while "Place on Face" mode is active
 const _raycaster       = new THREE.Raycaster();
+let _lastPaintHitPoint = null;        // THREE.Vector3 — last brush paint position for shift-line
+let _shiftLineMesh     = null;        // THREE.Line — preview line from last paint to cursor
 let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
@@ -310,6 +312,8 @@ function buildPresetGrid() {
   PRESETS.forEach((preset, idx) => {
     const swatch = document.createElement('div');
     swatch.className = 'preset-swatch';
+    swatch.setAttribute('role', 'button');
+    swatch.setAttribute('tabindex', '0');
     swatch.title = preset.name;
 
     // Use the small thumbnail canvas
@@ -321,6 +325,12 @@ function buildPresetGrid() {
     swatch.appendChild(label);
 
     swatch.addEventListener('click', () => selectPreset(idx, swatch));
+    swatch.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectPreset(idx, swatch);
+      }
+    });
     presetGrid.appendChild(swatch);
   });
 }
@@ -339,6 +349,32 @@ function selectPreset(idx, swatchEl) {
   resetTextureSmoothing();
   if (activeMapEntry.defaultScale != null) _applyScaleU(activeMapEntry.defaultScale);
   updatePreview();
+}
+
+// ── Accessibility: Modal focus trap ───────────────────────────────────────────
+function trapFocus(overlay) {
+  const focusable = overlay.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  first.focus();
+
+  function handler(e) {
+    if (e.key === 'Escape') {
+      overlay.classList.add('hidden');
+      overlay.removeEventListener('keydown', handler);
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    if (e.shiftKey) {
+      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+    } else {
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }
+  overlay.addEventListener('keydown', handler);
 }
 
 // ── Event wiring ──────────────────────────────────────────────────────────────
@@ -466,14 +502,14 @@ function wireEvents() {
   });
 
   // ── License ──
-  licenseLink.addEventListener('click', () => licenseOverlay.classList.remove('hidden'));
+  licenseLink.addEventListener('click', () => { licenseOverlay.classList.remove('hidden'); trapFocus(licenseOverlay); });
   licenseClose.addEventListener('click', () => licenseOverlay.classList.add('hidden'));
   licenseOverlay.addEventListener('click', (e) => {
     if (e.target === licenseOverlay) licenseOverlay.classList.add('hidden');
   });
 
   // ── Imprint & Privacy ──
-  imprintLink.addEventListener('click', () => imprintOverlay.classList.remove('hidden'));
+  imprintLink.addEventListener('click', () => { imprintOverlay.classList.remove('hidden'); trapFocus(imprintOverlay); });
   imprintClose.addEventListener('click', () => imprintOverlay.classList.add('hidden'));
   imprintOverlay.addEventListener('click', (e) => {
     if (e.target === imprintOverlay) imprintOverlay.classList.add('hidden');
@@ -494,6 +530,7 @@ function wireEvents() {
     const closeBtn = document.getElementById('sponsor-close');
     const storeLink = overlay.querySelector('.sponsor-link');
     overlay.classList.remove('hidden');
+    trapFocus(overlay);
 
     const dismiss = () => {
       if (document.getElementById('sponsor-dont-show').checked) {
@@ -530,7 +567,6 @@ function wireEvents() {
     exclBrushRadiusBtn.classList.remove('active');
     exclRadiusRow.classList.add('hidden');
     precisionMaskingRow.classList.add('hidden');
-    // Deactivate precision when switching away from circle mode
     if (precisionMaskingEnabled) deactivatePrecisionMasking();
     canvas.style.cursor = exclusionTool ? 'crosshair' : '';
     brushCursorEl.style.display = 'none';
@@ -683,6 +719,7 @@ function wireEvents() {
         if (exclusionTool === 'brush') {
           updateBrushCursor(ev);
           if (brushIsRadius && !isPainting && currentGeometry) updateBrushHover(ev);
+          _updateShiftLinePreview(ev);
         } else if (exclusionTool === 'bucket' && !isPainting && currentGeometry) {
           updateBucketHover(ev);
         }
@@ -708,7 +745,12 @@ function wireEvents() {
       if (exclusionTool) setExclusionTool(null);
       licenseOverlay.classList.add('hidden');
       imprintOverlay.classList.add('hidden');
+      _clearShiftLinePreview();
     }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Control') _clearShiftLinePreview();
   });
 }
 
@@ -867,6 +909,31 @@ function distSqPointToTri(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
   return qx*qx + qy*qy + qz*qz;
 }
 
+// ── Spatial grid for fast sphere queries ──────────────────────────────────
+let _spatialGrid = null;
+let _spatialCellSize = 0;
+let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
+
+function buildSpatialGrid(centroids, triCount, bounds) {
+  const vol = bounds.size.x * bounds.size.y * bounds.size.z;
+  const cellSize = Math.max(Math.cbrt(vol / Math.max(triCount, 1)) * 2, 1e-6);
+  _spatialCellSize = cellSize;
+  _spatialMinX = bounds.min.x;
+  _spatialMinY = bounds.min.y;
+  _spatialMinZ = bounds.min.z;
+  const grid = new Map();
+  for (let t = 0; t < triCount; t++) {
+    const gx = Math.floor((centroids[t*3]   - _spatialMinX) / cellSize);
+    const gy = Math.floor((centroids[t*3+1] - _spatialMinY) / cellSize);
+    const gz = Math.floor((centroids[t*3+2] - _spatialMinZ) / cellSize);
+    const key = (gx * 73856093) ^ (gy * 19349663) ^ (gz * 83492791);
+    let list = grid.get(key);
+    if (!list) { list = []; grid.set(key, list); }
+    list.push(t);
+  }
+  _spatialGrid = grid;
+}
+
 /** Test all triangles against a sphere and invoke cb(triIdx) for each hit. */
 function forEachTriInSphere(hitPt, r2, cb) {
   const usePrecision = precisionMaskingEnabled && precisionGeometry;
@@ -874,50 +941,69 @@ function forEachTriInSphere(hitPt, r2, cb) {
   const centroids = usePrecision ? precisionCentroids : triangleCentroids;
   const boundRadii = usePrecision ? precisionBoundRadii : triangleBoundRadii;
   const pos = geo.attributes.position;
-  const triCount = centroids.length / 3;
   const r = Math.sqrt(r2);
-  for (let t = 0; t < triCount; t++) {
-    // Quick reject: centroid distance > brush radius + triangle bounding radius
-    const dx = centroids[t*3]   - hitPt.x;
-    const dy = centroids[t*3+1] - hitPt.y;
-    const dz = centroids[t*3+2] - hitPt.z;
-    const bound = r + boundRadii[t];
-    if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
-    // Precise sphere-triangle test
-    const i = t * 3;
-    const d2 = distSqPointToTri(
-      hitPt.x, hitPt.y, hitPt.z,
-      pos.getX(i), pos.getY(i), pos.getZ(i),
-      pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1),
-      pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2),
-    );
-    if (d2 <= r2) cb(t);
+
+  if (!_spatialGrid) {
+    // Fallback: linear scan (grid not built yet)
+    const triCount = centroids.length / 3;
+    for (let t = 0; t < triCount; t++) {
+      const dx = centroids[t*3] - hitPt.x, dy = centroids[t*3+1] - hitPt.y, dz = centroids[t*3+2] - hitPt.z;
+      const bound = r + boundRadii[t];
+      if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
+      const i = t * 3;
+      const d2 = distSqPointToTri(hitPt.x, hitPt.y, hitPt.z,
+        pos.getX(i), pos.getY(i), pos.getZ(i),
+        pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1),
+        pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2));
+      if (d2 <= r2) cb(t);
+    }
+    return;
+  }
+
+  const cs = _spatialCellSize;
+  const xMin = Math.floor((hitPt.x - r - _spatialMinX) / cs);
+  const xMax = Math.floor((hitPt.x + r - _spatialMinX) / cs);
+  const yMin = Math.floor((hitPt.y - r - _spatialMinY) / cs);
+  const yMax = Math.floor((hitPt.y + r - _spatialMinY) / cs);
+  const zMin = Math.floor((hitPt.z - r - _spatialMinZ) / cs);
+  const zMax = Math.floor((hitPt.z + r - _spatialMinZ) / cs);
+
+  for (let gx = xMin; gx <= xMax; gx++) {
+    for (let gy = yMin; gy <= yMax; gy++) {
+      for (let gz = zMin; gz <= zMax; gz++) {
+        const key = (gx * 73856093) ^ (gy * 19349663) ^ (gz * 83492791);
+        const list = _spatialGrid.get(key);
+        if (!list) continue;
+        for (let li = 0; li < list.length; li++) {
+          const t = list[li];
+          const dx = centroids[t*3] - hitPt.x, dy = centroids[t*3+1] - hitPt.y, dz = centroids[t*3+2] - hitPt.z;
+          const bound = r + boundRadii[t];
+          if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
+          const i = t * 3;
+          const d2 = distSqPointToTri(hitPt.x, hitPt.y, hitPt.z,
+            pos.getX(i), pos.getY(i), pos.getZ(i),
+            pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1),
+            pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2));
+          if (d2 <= r2) cb(t);
+        }
+      }
+    }
   }
 }
 
-function paintAt(e) {
-  const mesh = getCurrentMesh();
-  if (!mesh) return;
-  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
-  const hits = _raycaster.intersectObject(mesh);
-  const hit = getFrontFaceHit(hits, mesh);
-  if (!hit) return;
-
+function _paintSingleHit(hit, mesh) {
   const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
-
   if (usePrecision) {
-    // Precision mode: store precision face indices for fine-grained selection
     if (brushIsRadius) {
       const r2 = brushRadius * brushRadius;
       forEachTriInSphere(hit.point, r2, t => {
         if (eraseMode) precisionExcludedFaces.delete(t); else precisionExcludedFaces.add(t);
       });
     } else {
-      const precIdx = hit.faceIndex; // precision face index (mesh is precision geometry)
+      const precIdx = hit.faceIndex;
       if (eraseMode) precisionExcludedFaces.delete(precIdx); else precisionExcludedFaces.add(precIdx);
     }
   } else {
-    // Normal mode: store original face indices
     let triIdx = hit.faceIndex;
     if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
       triIdx = dispPreviewParentMap[triIdx];
@@ -931,8 +1017,86 @@ function paintAt(e) {
       if (eraseMode) excludedFaces.delete(triIdx); else excludedFaces.add(triIdx);
     }
   }
+}
 
+function _paintLineBetween(from, to, mesh) {
+  // Sample points along the line and paint at each
+  const dist = from.distanceTo(to);
+  const step = brushIsRadius ? Math.max(brushRadius * 0.5, 0.1) : 0.5;
+  const steps = Math.max(Math.ceil(dist / step), 1);
+  const dir = new THREE.Vector3().subVectors(to, from);
+  const cam = getCamera();
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const pt = new THREE.Vector3().lerpVectors(from, to, t);
+    // Project 3D point to screen, then raycast back to find mesh hit
+    const ndc = pt.clone().project(cam);
+    _raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), cam);
+    const hits = _raycaster.intersectObject(mesh);
+    const hit = getFrontFaceHit(hits, mesh);
+    if (hit) _paintSingleHit(hit, mesh);
+  }
+}
+
+function paintAt(e) {
+  const mesh = getCurrentMesh();
+  if (!mesh) return;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hits = _raycaster.intersectObject(mesh);
+  const hit = getFrontFaceHit(hits, mesh);
+  if (!hit) return;
+
+  // Shift+click: draw line from last paint point to current
+  if (e.ctrlKey && _lastPaintHitPoint) {
+    _paintLineBetween(_lastPaintHitPoint, hit.point, mesh);
+    _clearShiftLinePreview();
+  } else {
+    _paintSingleHit(hit, mesh);
+  }
+
+  _lastPaintHitPoint = hit.point.clone();
   refreshExclusionOverlay();
+}
+
+// ── Place on Face ─────────────────────────────────────────────────────────────
+
+// ── Shift-line preview for brush painting ─────────────────────────────────
+
+function _updateShiftLinePreview(e) {
+  if (!e.ctrlKey || !_lastPaintHitPoint || !exclusionTool || exclusionTool !== 'brush') {
+    _clearShiftLinePreview();
+    return;
+  }
+  const mesh = getCurrentMesh();
+  if (!mesh) return;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hits = _raycaster.intersectObject(mesh);
+  const hit = getFrontFaceHit(hits, mesh);
+  if (!hit) { _clearShiftLinePreview(); return; }
+
+  const points = [_lastPaintHitPoint, hit.point];
+  if (_shiftLineMesh) {
+    _shiftLineMesh.geometry.setFromPoints(points);
+    _shiftLineMesh.geometry.attributes.position.needsUpdate = true;
+  } else {
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    const mat = new THREE.LineBasicMaterial({ color: 0x00ffaa, linewidth: 2, depthTest: false });
+    _shiftLineMesh = new THREE.Line(geo, mat);
+    _shiftLineMesh.renderOrder = 999;
+    const scene = mesh.parent.parent; // meshGroup → scene
+    if (scene) scene.add(_shiftLineMesh);
+  }
+  requestRender();
+}
+
+function _clearShiftLinePreview() {
+  if (_shiftLineMesh) {
+    if (_shiftLineMesh.parent) _shiftLineMesh.parent.remove(_shiftLineMesh);
+    _shiftLineMesh.geometry.dispose();
+    _shiftLineMesh.material.dispose();
+    _shiftLineMesh = null;
+    requestRender();
+  }
 }
 
 // ── Place on Face ─────────────────────────────────────────────────────────────
@@ -1055,6 +1219,7 @@ function handlePlaceOnFaceClick(e) {
   const adjData = buildAdjacency(currentGeometry);
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids; triangleBoundRadii = adjData.boundRadii;
+  buildSpatialGrid(triangleCentroids, currentGeometry.attributes.position.count / 3, currentBounds);
 
   // Update edge length for new bounds
   const maxDim = Math.max(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
@@ -1309,6 +1474,7 @@ function loadDefaultCube() {
   const adjData = buildAdjacency(geo);
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids; triangleBoundRadii = adjData.boundRadii;
+  buildSpatialGrid(triangleCentroids, geo.attributes.position.count / 3, currentBounds);
 
   settings.scaleU  = 0.5; scaleUSlider.value = scaleToPos(0.5); scaleUVal.value = 0.5;
   settings.scaleV  = 0.5; scaleVSlider.value = scaleToPos(0.5); scaleVVal.value = 0.5;
@@ -1403,6 +1569,7 @@ async function handleModelFile(file) {
     const adjData = buildAdjacency(geometry);
     triangleAdjacency = adjData.adjacency;
     triangleCentroids = adjData.centroids; triangleBoundRadii = adjData.boundRadii;
+    buildSpatialGrid(triangleCentroids, geometry.attributes.position.count / 3, bounds);
 
     // Reset scale & offset sliders so scale=1 = one tile covers the full bounding box
     const resetVal = (slider, valEl, value) => {
@@ -1871,6 +2038,10 @@ function deactivatePrecisionMasking() {
     triangleCentroids  = precisionCentroids;
     triangleBoundRadii = precisionBoundRadii;
 
+    // Rebuild spatial grid for the promoted base mesh
+    const triCount = currentGeometry.attributes.position.count / 3;
+    buildSpatialGrid(triangleCentroids, triCount, currentBounds);
+
     // Promote precision excluded faces to the base set
     excludedFaces = precisionExcludedFaces;
 
@@ -1950,6 +2121,10 @@ async function refreshPrecisionMesh() {
     precisionAdjacency  = adjData.adjacency;
     precisionCentroids  = adjData.centroids;
     precisionBoundRadii = adjData.boundRadii;
+
+    // Rebuild spatial grid for the precision mesh so brush queries are fast
+    const precTriCount = precisionGeometry.attributes.position.count / 3;
+    buildSpatialGrid(precisionCentroids, precTriCount, currentBounds);
 
     // Seed precisionExcludedFaces from existing excludedFaces
     precisionExcludedFaces = new Set();

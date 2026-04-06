@@ -134,7 +134,7 @@ export async function decimate(geometry, targetTriangles, onProgress) {
     if (nsh < 2) continue;
 
     // ── Three safety guards ───────────────────────────────────────────────────
-    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2)) continue;          // Guard 2
+    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, vertCount)) continue;          // Guard 2
     if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v1, v2, px, py, pz)) continue; // Guard 3a
     if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v2, v1, px, py, pz)) continue; // Guard 3b
 
@@ -267,7 +267,8 @@ function sharedFaceCount(faces, vfHead, slotFace, slotNext, v1, v2) {
 // Uses module-level scratch arrays (_hlvHi, _hlvLo) — zero allocation per call.
 // Linear scan is faster than Set for typical STL vertex valence (5-8).
 
-function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
+function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, vc) {
+  const MUL = vc < 0x200000 ? 0x200000 : vc + 1;
   let n = 0;
   for (let s = vfHead[v1]; s >= 0; s = slotNext[s]) {
     const f = slotFace[s];
@@ -278,7 +279,7 @@ function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     if (fb > fc) { t = fb; fb = fc; fc = t; }
     if (fa > fb) { t = fa; fa = fb; fb = t; }
-    _hlvHi[n] = fa * 0x200000 + fb;
+    _hlvHi[n] = fa * MUL + fb;
     _hlvLo[n] = fc;
     n++;
   }
@@ -292,7 +293,7 @@ function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     if (fb > fc) { t = fb; fb = fc; fc = t; }
     if (fa > fb) { t = fa; fa = fb; fb = t; }
-    const hi = fa * 0x200000 + fb;
+    const hi = fa * MUL + fb;
     for (let i = 0; i < n; i++) {
       if (_hlvHi[i] === hi && _hlvLo[i] === fc) return true;
     }
@@ -495,7 +496,9 @@ function solveQ(q, v1, v2) {
   const b2  = -(q[o1+8] + q[o2+8]);
 
   const det = a00*(a11*a22 - a12*a12) - a01*(a01*a22 - a12*a02) + a02*(a01*a12 - a11*a02);
-  if (Math.abs(det) < 1e-10) return false;
+  const maxEl = Math.max(Math.abs(a00), Math.abs(a01), Math.abs(a02), Math.abs(a11), Math.abs(a12), Math.abs(a22));
+  const threshold = maxEl * maxEl * maxEl * 1e-10;
+  if (Math.abs(det) < Math.max(threshold, 1e-30)) return false;
 
   const inv = 1 / det;
   _s[0] = inv * (b0*(a11*a22 - a12*a12) - a01*(b1*a22 - a12*b2) + a02*(b1*a12 - a11*b2));
