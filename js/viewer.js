@@ -4,6 +4,14 @@ import { LineSegments2 }  from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial }   from 'three/addons/lines/LineMaterial.js';
 
+// Pre-allocated temp objects for hot-path event handlers (avoid GC pressure)
+const _tmpQ1 = new THREE.Quaternion();
+const _tmpQ2 = new THREE.Quaternion();
+const _tmpV1 = new THREE.Vector3();
+const _tmpV2 = new THREE.Vector3();
+const _tmpV3 = new THREE.Vector3();
+const _tmpV4 = new THREE.Vector3();
+
 let renderer, camera, scene, controls, meshGroup, ambientLight, dirLight1, dirLight2, grid;
 let currentMesh = null;
 let axesGroup = null;
@@ -12,6 +20,9 @@ let wireframeLines = null;   // LineSegments overlay, or null when hidden
 let wireframeVisible = false;
 let exclusionMesh = null;    // flat orange overlay for user-excluded faces
 let hoverMesh = null;        // semi-transparent yellow bucket-fill preview
+let _exclMaterial = null;
+let _hoverMaterial = null;
+let _needsRender = true;
 
 // Build a labelled coordinate axes indicator scaled to `size`.
 // X = red, Y = green, Z = blue (up).
@@ -141,8 +152,7 @@ export function initViewer(canvas) {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.1;
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.enabled = false;
 
   // Scene
   scene = new THREE.Scene();
@@ -166,8 +176,7 @@ export function initViewer(canvas) {
 
   dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
   dirLight1.position.set(80, 120, 60);
-  dirLight1.castShadow = true;
-  dirLight1.shadow.mapSize.set(1024, 1024);
+  dirLight1.castShadow = false;
   scene.add(dirLight1);
 
   dirLight2 = new THREE.DirectionalLight(0x8899ff, 0.4);
@@ -229,6 +238,7 @@ export function initViewer(canvas) {
     const markerScale = (camera.top / camera.zoom) * 0.015;
     _pivotMarker.scale.setScalar(markerScale);
     _pivotMarker.visible = true;
+    _needsRender = true;
   });
 
   document.addEventListener('pointermove', (e) => {
@@ -240,24 +250,24 @@ export function initViewer(canvas) {
 
     const rotSpeed = 0.005;
     // Horizontal: rotate around world Z (up)
-    const qH = new THREE.Quaternion().setFromAxisAngle(
-      new THREE.Vector3(0, 0, 1), -dx * rotSpeed);
+    _tmpQ1.setFromAxisAngle(_tmpV1.set(0, 0, 1), -dx * rotSpeed);
     // Vertical: rotate around camera's local X (right vector)
-    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
-    const qV = new THREE.Quaternion().setFromAxisAngle(right, -dy * rotSpeed);
-    const qTotal = new THREE.Quaternion().multiplyQuaternions(qV, qH);
+    _tmpV2.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    _tmpQ2.setFromAxisAngle(_tmpV2, -dy * rotSpeed);
+    _tmpQ1.premultiply(_tmpQ2); // _tmpQ1 = qV * qH (total rotation)
 
     // Rotate camera position around the pivot
-    const camOff = camera.position.clone().sub(_customPivot);
-    camOff.applyQuaternion(qTotal);
-    camera.position.copy(_customPivot).add(camOff);
+    _tmpV3.copy(camera.position).sub(_customPivot);
+    _tmpV3.applyQuaternion(_tmpQ1);
+    camera.position.copy(_customPivot).add(_tmpV3);
 
     // Rotate orbit target around the same pivot so OrbitControls stays in sync
-    const tgtOff = controls.target.clone().sub(_customPivot);
-    tgtOff.applyQuaternion(qTotal);
-    controls.target.copy(_customPivot).add(tgtOff);
+    _tmpV4.copy(controls.target).sub(_customPivot);
+    _tmpV4.applyQuaternion(_tmpQ1);
+    controls.target.copy(_customPivot).add(_tmpV4);
 
     camera.lookAt(controls.target);
+    _needsRender = true;
   });
 
   document.addEventListener('pointerup', () => {
@@ -266,6 +276,7 @@ export function initViewer(canvas) {
       _lastPointer  = null;
       controls.enableRotate = true;
       _pivotMarker.visible = false;
+      _needsRender = true;
     }
   });
 
@@ -300,26 +311,27 @@ export function initViewer(canvas) {
     const curNdcX  =  ((midX - rect.left) / rect.width)  * 2 - 1;
     const curNdcY  = -((midY - rect.top)  / rect.height) * 2 + 1;
 
-    const prevWorld = new THREE.Vector3(prevNdcX, prevNdcY, 0).unproject(camera);
-    const curWorld  = new THREE.Vector3(curNdcX,  curNdcY,  0).unproject(camera);
-    const panDelta  = prevWorld.sub(curWorld);
-    camera.position.add(panDelta);
-    controls.target.add(panDelta);
+    _tmpV1.set(prevNdcX, prevNdcY, 0).unproject(camera);
+    _tmpV2.set(curNdcX,  curNdcY,  0).unproject(camera);
+    _tmpV1.sub(_tmpV2); // panDelta
+    camera.position.add(_tmpV1);
+    controls.target.add(_tmpV1);
 
     // ── Zoom: zoom toward the current midpoint ────────────────────────
     const factor = newDist / _pinchDist;
-    const before = new THREE.Vector3(curNdcX, curNdcY, 0).unproject(camera);
+    _tmpV3.set(curNdcX, curNdcY, 0).unproject(camera);
     camera.zoom = Math.max(0.05, Math.min(200, camera.zoom * factor));
     camera.updateProjectionMatrix();
-    const after = new THREE.Vector3(curNdcX, curNdcY, 0).unproject(camera);
+    _tmpV4.set(curNdcX, curNdcY, 0).unproject(camera);
 
-    const zoomDelta = before.clone().sub(after);
-    camera.position.add(zoomDelta);
-    controls.target.add(zoomDelta);
+    _tmpV3.sub(_tmpV4); // zoomDelta
+    camera.position.add(_tmpV3);
+    controls.target.add(_tmpV3);
 
     _pinchDist = newDist;
     _pinchMid  = { x: midX, y: midY };
     controls.update();
+    _needsRender = true;
   }, { passive: false });
 
   renderer.domElement.addEventListener('touchend', (e) => {
@@ -338,7 +350,7 @@ export function initViewer(canvas) {
     const ndcY = -((e.clientY - rect.top)  / rect.height) * 2 + 1;
 
     // World position under cursor before zoom
-    const before = new THREE.Vector3(ndcX, ndcY, 0).unproject(camera);
+    _tmpV1.set(ndcX, ndcY, 0).unproject(camera);
 
     // Apply zoom
     const factor = e.deltaY > 0 ? 1 / 1.1 : 1.1;
@@ -346,12 +358,12 @@ export function initViewer(canvas) {
     camera.updateProjectionMatrix();
 
     // World position under cursor after zoom
-    const after = new THREE.Vector3(ndcX, ndcY, 0).unproject(camera);
+    _tmpV2.set(ndcX, ndcY, 0).unproject(camera);
 
     // Shift camera + target so the world point stays under the cursor
-    const delta = before.clone().sub(after);
-    camera.position.add(delta);
-    controls.target.add(delta);
+    _tmpV1.sub(_tmpV2); // delta = before - after
+    camera.position.add(_tmpV1);
+    controls.target.add(_tmpV1);
     controls.update();
   }, { passive: false });
 
@@ -360,12 +372,17 @@ export function initViewer(canvas) {
   resizeObserver.observe(canvas.parentElement);
   onResize();
 
+  // Damping needs controls.update() every frame; re-render only when needed
+  controls.addEventListener('change', () => { _needsRender = true; });
+
   // Render loop
   (function animate() {
     requestAnimationFrame(animate);
     controls.update();
-
-    renderer.render(scene, camera);
+    if (_needsRender) {
+      _needsRender = false;
+      renderer.render(scene, camera);
+    }
   })();
 }
 
@@ -387,6 +404,21 @@ function onResize() {
       h * renderer.getPixelRatio(),
     );
   }
+  requestRender();
+}
+
+function disposeGroup(group) {
+  group.traverse(obj => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+      if (Array.isArray(obj.material)) {
+        obj.material.forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+      } else {
+        if (obj.material.map) obj.material.map.dispose();
+        obj.material.dispose();
+      }
+    }
+  });
 }
 
 /**
@@ -435,7 +467,7 @@ export function loadGeometry(geometry, material) {
   fitCamera(sphere);
 
   // Place coordinate axes away from the part corner
-  if (axesGroup) scene.remove(axesGroup);
+  if (axesGroup) { disposeGroup(axesGroup); scene.remove(axesGroup); }
   const axisSize = sphere.radius * 0.30;
   axesGroup = buildAxesIndicator(axisSize);
   // Offset from the bounding box corner by ~1 axis-length so it doesn't overlap the mesh
@@ -444,9 +476,10 @@ export function loadGeometry(geometry, material) {
   scene.add(axesGroup);
 
   // Bounding-box dimension annotations on the ground plane
-  if (dimensionGroup) scene.remove(dimensionGroup);
+  if (dimensionGroup) { disposeGroup(dimensionGroup); scene.remove(dimensionGroup); }
   dimensionGroup = buildDimensions(box, groundZ, sphere.radius);
   scene.add(dimensionGroup);
+  requestRender();
 }
 
 /**
@@ -464,6 +497,7 @@ export function setMeshMaterial(material) {
     metalness: 0.1,
     side: THREE.DoubleSide,
   });
+  requestRender();
 }
 
 /**
@@ -484,6 +518,7 @@ export function setMeshGeometry(geometry) {
     wireframeLines = null;
   }
   if (wireframeVisible) _buildWireframe(geometry);
+  requestRender();
 }
 
 /**
@@ -514,6 +549,8 @@ function fitCamera(sphere) {
   controls.update();
 }
 
+export function requestRender() { _needsRender = true; }
+
 export function getRenderer()  { return renderer; }
 export function getCamera()    { return camera; }
 export function getScene()     { return scene; }
@@ -522,6 +559,7 @@ export function getCurrentMesh() { return currentMesh; }
 
 export function setSceneBackground(hexColor) {
   if (scene) scene.background = new THREE.Color(hexColor);
+  requestRender();
 }
 
 export function setViewerTheme(isLight) {
@@ -541,6 +579,7 @@ export function setViewerTheme(isLight) {
   grid.rotation.x = Math.PI / 2;
   grid.position.z = savedZ;
   scene.add(grid);
+  requestRender();
 }
 
 /**
@@ -556,13 +595,11 @@ export function setExclusionOverlay(overlayGeo, color = 0xff6600, opacity = 1.0)
   if (exclusionMesh) {
     scene.remove(exclusionMesh);
     exclusionMesh.geometry.dispose();
-    exclusionMesh.material.dispose();
     exclusionMesh = null;
   }
-  if (!overlayGeo || overlayGeo.attributes.position.count === 0) return;
-  exclusionMesh = new THREE.Mesh(
-    overlayGeo,
-    new THREE.MeshLambertMaterial({
+  if (!overlayGeo || overlayGeo.attributes.position.count === 0) { requestRender(); return; }
+  if (!_exclMaterial) {
+    _exclMaterial = new THREE.MeshLambertMaterial({
       color,
       side: THREE.DoubleSide,
       transparent: opacity < 1.0,
@@ -570,10 +607,16 @@ export function setExclusionOverlay(overlayGeo, color = 0xff6600, opacity = 1.0)
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
-    }),
-  );
+    });
+  } else {
+    _exclMaterial.color.set(color);
+    _exclMaterial.opacity = opacity;
+    _exclMaterial.transparent = opacity < 1.0;
+  }
+  exclusionMesh = new THREE.Mesh(overlayGeo, _exclMaterial);
   exclusionMesh.renderOrder = 1;
   scene.add(exclusionMesh);
+  requestRender();
 }
 
 /**
@@ -586,13 +629,11 @@ export function setHoverPreview(overlayGeo, color = 0xffee00) {
   if (hoverMesh) {
     scene.remove(hoverMesh);
     hoverMesh.geometry.dispose();
-    hoverMesh.material.dispose();
     hoverMesh = null;
   }
-  if (!overlayGeo || overlayGeo.attributes.position.count === 0) return;
-  hoverMesh = new THREE.Mesh(
-    overlayGeo,
-    new THREE.MeshBasicMaterial({
+  if (!overlayGeo || overlayGeo.attributes.position.count === 0) { requestRender(); return; }
+  if (!_hoverMaterial) {
+    _hoverMaterial = new THREE.MeshBasicMaterial({
       color,
       side: THREE.DoubleSide,
       transparent: true,
@@ -600,10 +641,14 @@ export function setHoverPreview(overlayGeo, color = 0xffee00) {
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
-    }),
-  );
+    });
+  } else {
+    _hoverMaterial.color.set(color);
+  }
+  hoverMesh = new THREE.Mesh(overlayGeo, _hoverMaterial);
   hoverMesh.renderOrder = 2;
   scene.add(hoverMesh);
+  requestRender();
 }
 
 /**
@@ -618,6 +663,7 @@ export function setWireframe(enabled) {
   } else {
     if (wireframeLines) wireframeLines.visible = false;
   }
+  requestRender();
 }
 
 function _buildWireframe(geometry) {

@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWireframe,
          getControls, getCamera, getCurrentMesh,
-         setExclusionOverlay, setHoverPreview, setViewerTheme } from './viewer.js';
+         setExclusionOverlay, setHoverPreview, setViewerTheme,
+         requestRender } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
 import { loadPresets, loadCustomTexture }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
@@ -31,7 +32,7 @@ let _falloffGeometry   = null;   // geometry the falloff was last computed for
 
 // ── Exclusion state ───────────────────────────────────────────────────────────
 let excludedFaces      = new Set();   // triangle indices in currentGeometry
-let triangleAdjacency  = null;        // Map from buildAdjacency
+let triangleAdjacency  = null;        // Array from buildAdjacency
 let triangleCentroids  = null;        // Float32Array from buildAdjacency
 let triangleBoundRadii = null;        // Float32Array — max vertex-to-centroid dist per tri
 let exclusionTool      = null;        // 'brush' | 'bucket' | null
@@ -44,6 +45,11 @@ let selectionMode      = false;       // false = exclude painted faces; true = i
 let _lastHoverTriIdx   = -1;          // last triangle index used for hover preview
 let placeOnFaceActive  = false;       // true while "Place on Face" mode is active
 const _raycaster       = new THREE.Raycaster();
+let _lastPaintHitPoint = null;        // THREE.Vector3 — last brush paint position for shift-line
+let _shiftLineMesh     = null;        // THREE.Line — preview line from last paint to cursor
+let _lastEffectiveTexture = null;
+let _effectiveMapCache    = null;
+let _effectiveMapCacheKey = null;
 
 const settings = {
   mappingMode:   5,     // Triplanar default
@@ -146,7 +152,7 @@ let precisionEdgeLength     = null;   // edge length used for current refinement
 let precisionBusy           = false;  // true while async subdivision is running
 let precisionCentroids      = null;   // Float32Array from buildAdjacency on refined mesh
 let precisionBoundRadii     = null;   // Float32Array — max vertex-to-centroid per refined tri
-let precisionAdjacency      = null;   // Map from buildAdjacency on refined mesh
+let precisionAdjacency      = null;   // Array from buildAdjacency on refined mesh
 let precisionExcludedFaces  = new Set(); // precision face indices excluded while precision is active
 
 // ── Displacement preview state ────────────────────────────────────────────────
@@ -349,6 +355,8 @@ function buildPresetGrid() {
   PRESETS.forEach((preset, idx) => {
     const swatch = document.createElement('div');
     swatch.className = 'preset-swatch';
+    swatch.setAttribute('role', 'button');
+    swatch.setAttribute('tabindex', '0');
     swatch.title = preset.name;
 
     // Use the small thumbnail canvas
@@ -360,6 +368,12 @@ function buildPresetGrid() {
     swatch.appendChild(label);
 
     swatch.addEventListener('click', () => selectPreset(idx, swatch));
+    swatch.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectPreset(idx, swatch);
+      }
+    });
     presetGrid.appendChild(swatch);
   });
 }
@@ -378,6 +392,32 @@ function selectPreset(idx, swatchEl) {
   resetTextureSmoothing();
   if (activeMapEntry.defaultScale != null) _applyScaleU(activeMapEntry.defaultScale);
   updatePreview();
+}
+
+// ── Accessibility: Modal focus trap ───────────────────────────────────────────
+function trapFocus(overlay) {
+  const focusable = overlay.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  first.focus();
+
+  function handler(e) {
+    if (e.key === 'Escape') {
+      overlay.classList.add('hidden');
+      overlay.removeEventListener('keydown', handler);
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    if (e.shiftKey) {
+      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+    } else {
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }
+  overlay.addEventListener('keydown', handler);
 }
 
 // ── Event wiring ──────────────────────────────────────────────────────────────
@@ -490,14 +530,14 @@ function wireEvents() {
   });
 
   // ── License ──
-  licenseLink.addEventListener('click', () => licenseOverlay.classList.remove('hidden'));
+  licenseLink.addEventListener('click', () => { licenseOverlay.classList.remove('hidden'); trapFocus(licenseOverlay); });
   licenseClose.addEventListener('click', () => licenseOverlay.classList.add('hidden'));
   licenseOverlay.addEventListener('click', (e) => {
     if (e.target === licenseOverlay) licenseOverlay.classList.add('hidden');
   });
 
   // ── Imprint & Privacy ──
-  imprintLink.addEventListener('click', () => imprintOverlay.classList.remove('hidden'));
+  imprintLink.addEventListener('click', () => { imprintOverlay.classList.remove('hidden'); trapFocus(imprintOverlay); });
   imprintClose.addEventListener('click', () => imprintOverlay.classList.add('hidden'));
   imprintOverlay.addEventListener('click', (e) => {
     if (e.target === imprintOverlay) imprintOverlay.classList.add('hidden');
@@ -518,6 +558,7 @@ function wireEvents() {
     const closeBtn = document.getElementById('sponsor-close');
     const storeLink = overlay.querySelector('.sponsor-link');
     overlay.classList.remove('hidden');
+    trapFocus(overlay);
 
     const dismiss = () => {
       if (document.getElementById('sponsor-dont-show').checked) {
@@ -554,7 +595,6 @@ function wireEvents() {
     exclBrushRadiusBtn.classList.remove('active');
     exclRadiusRow.classList.add('hidden');
     precisionMaskingRow.classList.add('hidden');
-    // Deactivate precision when switching away from circle mode
     if (precisionMaskingEnabled) deactivatePrecisionMasking();
     canvas.style.cursor = exclusionTool ? 'crosshair' : '';
     brushCursorEl.style.display = 'none';
@@ -676,23 +716,42 @@ function wireEvents() {
     }
   });
 
+  // RAF-Batching: paint events fire immediately, hover/cursor batched per frame
+  let _pendingHoverEvent = null;
+  let _hoverRafId = 0;
+
   canvas.addEventListener('mousemove', (e) => {
-    if (placeOnFaceActive && currentGeometry) {
-      updatePlaceOnFaceHover(e);
-      return;
-    }
-    if (exclusionTool === 'brush' && brushIsRadius) {
-      updateBrushCursor(e);
-    }
+    // Paint-Events sofort verarbeiten (jeder Event zaehlt fuer lueckenloses Malen)
     if (isPainting && exclusionTool === 'brush') {
       paintAt(e);
+      // Cursor-Update kann warten
+      _pendingHoverEvent = e;
+      if (!_hoverRafId) {
+        _hoverRafId = requestAnimationFrame(() => {
+          _hoverRafId = 0;
+          if (_pendingHoverEvent) updateBrushCursor(_pendingHoverEvent);
+          _pendingHoverEvent = null;
+        });
+      }
       return;
     }
-    if (!isPainting && exclusionTool === 'brush' && currentGeometry) {
-      updateBrushHover(e);
-    }
-    if (!isPainting && exclusionTool === 'bucket' && currentGeometry) {
-      updateBucketHover(e);
+    // Alle anderen Hover-Pfade: RAF-Batching OK
+    _pendingHoverEvent = e;
+    if (!_hoverRafId) {
+      _hoverRafId = requestAnimationFrame(() => {
+        _hoverRafId = 0;
+        const ev = _pendingHoverEvent;
+        if (!ev) return;
+        _pendingHoverEvent = null;
+        if (placeOnFaceActive && currentGeometry) { updatePlaceOnFaceHover(ev); return; }
+        if (exclusionTool === 'brush') {
+          updateBrushCursor(ev);
+          if (!isPainting && currentGeometry) updateBrushHover(ev);
+          _updateShiftLinePreview(ev);
+        } else if (exclusionTool === 'bucket' && !isPainting && currentGeometry) {
+          updateBucketHover(ev);
+        }
+      });
     }
   });
 
@@ -714,7 +773,12 @@ function wireEvents() {
       if (exclusionTool) setExclusionTool(null);
       licenseOverlay.classList.add('hidden');
       imprintOverlay.classList.add('hidden');
+      _clearShiftLinePreview();
     }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Control') _clearShiftLinePreview();
   });
 }
 
@@ -775,19 +839,23 @@ function setExclusionTool(tool) {
     getControls().enabled = true;
     // Recompute boundary falloff now that masking is done
     if (_falloffDirty && currentGeometry) {
-      const activeGeo = (settings.useDisplacement && dispPreviewGeometry)
-        ? dispPreviewGeometry : currentGeometry;
+      const activeGeo = (precisionMaskingEnabled && precisionGeometry)
+        ? precisionGeometry
+        : (settings.useDisplacement && dispPreviewGeometry)
+          ? dispPreviewGeometry : currentGeometry;
       updateFaceMask(activeGeo);
     }
   }
 }
 
+const _ndcResult = new THREE.Vector2();
 function _canvasNDC(e) {
   const rect = canvas.getBoundingClientRect();
-  return new THREE.Vector2(
+  _ndcResult.set(
     ((e.clientX - rect.left) / rect.width)  *  2 - 1,
     ((e.clientY - rect.top)  / rect.height) * -2 + 1,
   );
+  return _ndcResult;
 }
 
 // The preview material uses THREE.DoubleSide, so the raycaster can return
@@ -877,6 +945,31 @@ function distSqPointToTri(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
   return qx*qx + qy*qy + qz*qz;
 }
 
+// ── Spatial grid for fast sphere queries ──────────────────────────────────
+let _spatialGrid = null;
+let _spatialCellSize = 0;
+let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
+
+function buildSpatialGrid(centroids, triCount, bounds) {
+  const vol = bounds.size.x * bounds.size.y * bounds.size.z;
+  const cellSize = Math.max(Math.cbrt(vol / Math.max(triCount, 1)) * 2, 1e-6);
+  _spatialCellSize = cellSize;
+  _spatialMinX = bounds.min.x;
+  _spatialMinY = bounds.min.y;
+  _spatialMinZ = bounds.min.z;
+  const grid = new Map();
+  for (let t = 0; t < triCount; t++) {
+    const gx = Math.floor((centroids[t*3]   - _spatialMinX) / cellSize);
+    const gy = Math.floor((centroids[t*3+1] - _spatialMinY) / cellSize);
+    const gz = Math.floor((centroids[t*3+2] - _spatialMinZ) / cellSize);
+    const key = (gx * 73856093) ^ (gy * 19349663) ^ (gz * 83492791);
+    let list = grid.get(key);
+    if (!list) { list = []; grid.set(key, list); }
+    list.push(t);
+  }
+  _spatialGrid = grid;
+}
+
 /** Test all triangles against a sphere and invoke cb(triIdx) for each hit. */
 function forEachTriInSphere(hitPt, r2, cb) {
   const usePrecision = precisionMaskingEnabled && precisionGeometry;
@@ -884,50 +977,69 @@ function forEachTriInSphere(hitPt, r2, cb) {
   const centroids = usePrecision ? precisionCentroids : triangleCentroids;
   const boundRadii = usePrecision ? precisionBoundRadii : triangleBoundRadii;
   const pos = geo.attributes.position;
-  const triCount = centroids.length / 3;
   const r = Math.sqrt(r2);
-  for (let t = 0; t < triCount; t++) {
-    // Quick reject: centroid distance > brush radius + triangle bounding radius
-    const dx = centroids[t*3]   - hitPt.x;
-    const dy = centroids[t*3+1] - hitPt.y;
-    const dz = centroids[t*3+2] - hitPt.z;
-    const bound = r + boundRadii[t];
-    if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
-    // Precise sphere-triangle test
-    const i = t * 3;
-    const d2 = distSqPointToTri(
-      hitPt.x, hitPt.y, hitPt.z,
-      pos.getX(i), pos.getY(i), pos.getZ(i),
-      pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1),
-      pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2),
-    );
-    if (d2 <= r2) cb(t);
+
+  if (!_spatialGrid) {
+    // Fallback: linear scan (grid not built yet)
+    const triCount = centroids.length / 3;
+    for (let t = 0; t < triCount; t++) {
+      const dx = centroids[t*3] - hitPt.x, dy = centroids[t*3+1] - hitPt.y, dz = centroids[t*3+2] - hitPt.z;
+      const bound = r + boundRadii[t];
+      if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
+      const i = t * 3;
+      const d2 = distSqPointToTri(hitPt.x, hitPt.y, hitPt.z,
+        pos.getX(i), pos.getY(i), pos.getZ(i),
+        pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1),
+        pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2));
+      if (d2 <= r2) cb(t);
+    }
+    return;
+  }
+
+  const cs = _spatialCellSize;
+  const xMin = Math.floor((hitPt.x - r - _spatialMinX) / cs);
+  const xMax = Math.floor((hitPt.x + r - _spatialMinX) / cs);
+  const yMin = Math.floor((hitPt.y - r - _spatialMinY) / cs);
+  const yMax = Math.floor((hitPt.y + r - _spatialMinY) / cs);
+  const zMin = Math.floor((hitPt.z - r - _spatialMinZ) / cs);
+  const zMax = Math.floor((hitPt.z + r - _spatialMinZ) / cs);
+
+  for (let gx = xMin; gx <= xMax; gx++) {
+    for (let gy = yMin; gy <= yMax; gy++) {
+      for (let gz = zMin; gz <= zMax; gz++) {
+        const key = (gx * 73856093) ^ (gy * 19349663) ^ (gz * 83492791);
+        const list = _spatialGrid.get(key);
+        if (!list) continue;
+        for (let li = 0; li < list.length; li++) {
+          const t = list[li];
+          const dx = centroids[t*3] - hitPt.x, dy = centroids[t*3+1] - hitPt.y, dz = centroids[t*3+2] - hitPt.z;
+          const bound = r + boundRadii[t];
+          if (dx*dx + dy*dy + dz*dz > bound*bound) continue;
+          const i = t * 3;
+          const d2 = distSqPointToTri(hitPt.x, hitPt.y, hitPt.z,
+            pos.getX(i), pos.getY(i), pos.getZ(i),
+            pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1),
+            pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2));
+          if (d2 <= r2) cb(t);
+        }
+      }
+    }
   }
 }
 
-function paintAt(e) {
-  const mesh = getCurrentMesh();
-  if (!mesh) return;
-  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
-  const hits = _raycaster.intersectObject(mesh);
-  const hit = getFrontFaceHit(hits, mesh);
-  if (!hit) return;
-
+function _paintSingleHit(hit, mesh) {
   const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
-
   if (usePrecision) {
-    // Precision mode: store precision face indices for fine-grained selection
     if (brushIsRadius) {
       const r2 = brushRadius * brushRadius;
       forEachTriInSphere(hit.point, r2, t => {
         if (eraseMode) precisionExcludedFaces.delete(t); else precisionExcludedFaces.add(t);
       });
     } else {
-      const precIdx = hit.faceIndex; // precision face index (mesh is precision geometry)
+      const precIdx = hit.faceIndex;
       if (eraseMode) precisionExcludedFaces.delete(precIdx); else precisionExcludedFaces.add(precIdx);
     }
   } else {
-    // Normal mode: store original face indices
     let triIdx = hit.faceIndex;
     if (dispPreviewGeometry && mesh.geometry === dispPreviewGeometry && dispPreviewParentMap) {
       triIdx = dispPreviewParentMap[triIdx];
@@ -941,8 +1053,86 @@ function paintAt(e) {
       if (eraseMode) excludedFaces.delete(triIdx); else excludedFaces.add(triIdx);
     }
   }
+}
 
+function _paintLineBetween(from, to, mesh) {
+  // Sample points along the line and paint at each
+  const dist = from.distanceTo(to);
+  const step = brushIsRadius ? Math.max(brushRadius * 0.5, 0.1) : 0.5;
+  const steps = Math.max(Math.ceil(dist / step), 1);
+  const dir = new THREE.Vector3().subVectors(to, from);
+  const cam = getCamera();
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const pt = new THREE.Vector3().lerpVectors(from, to, t);
+    // Project 3D point to screen, then raycast back to find mesh hit
+    const ndc = pt.clone().project(cam);
+    _raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), cam);
+    const hits = _raycaster.intersectObject(mesh);
+    const hit = getFrontFaceHit(hits, mesh);
+    if (hit) _paintSingleHit(hit, mesh);
+  }
+}
+
+function paintAt(e) {
+  const mesh = getCurrentMesh();
+  if (!mesh) return;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hits = _raycaster.intersectObject(mesh);
+  const hit = getFrontFaceHit(hits, mesh);
+  if (!hit) return;
+
+  // Shift+click: draw line from last paint point to current
+  if (e.ctrlKey && _lastPaintHitPoint) {
+    _paintLineBetween(_lastPaintHitPoint, hit.point, mesh);
+    _clearShiftLinePreview();
+  } else {
+    _paintSingleHit(hit, mesh);
+  }
+
+  _lastPaintHitPoint = hit.point.clone();
   refreshExclusionOverlay();
+}
+
+// ── Place on Face ─────────────────────────────────────────────────────────────
+
+// ── Shift-line preview for brush painting ─────────────────────────────────
+
+function _updateShiftLinePreview(e) {
+  if (!e.ctrlKey || !_lastPaintHitPoint || !exclusionTool || exclusionTool !== 'brush') {
+    _clearShiftLinePreview();
+    return;
+  }
+  const mesh = getCurrentMesh();
+  if (!mesh) return;
+  _raycaster.setFromCamera(_canvasNDC(e), getCamera());
+  const hits = _raycaster.intersectObject(mesh);
+  const hit = getFrontFaceHit(hits, mesh);
+  if (!hit) { _clearShiftLinePreview(); return; }
+
+  const points = [_lastPaintHitPoint, hit.point];
+  if (_shiftLineMesh) {
+    _shiftLineMesh.geometry.setFromPoints(points);
+    _shiftLineMesh.geometry.attributes.position.needsUpdate = true;
+  } else {
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    const mat = new THREE.LineBasicMaterial({ color: 0x00ffaa, linewidth: 2, depthTest: false });
+    _shiftLineMesh = new THREE.Line(geo, mat);
+    _shiftLineMesh.renderOrder = 999;
+    const scene = mesh.parent.parent; // meshGroup → scene
+    if (scene) scene.add(_shiftLineMesh);
+  }
+  requestRender();
+}
+
+function _clearShiftLinePreview() {
+  if (_shiftLineMesh) {
+    if (_shiftLineMesh.parent) _shiftLineMesh.parent.remove(_shiftLineMesh);
+    _shiftLineMesh.geometry.dispose();
+    _shiftLineMesh.material.dispose();
+    _shiftLineMesh = null;
+    requestRender();
+  }
 }
 
 // ── Place on Face ─────────────────────────────────────────────────────────────
@@ -1065,10 +1255,11 @@ function handlePlaceOnFaceClick(e) {
   const adjData = buildAdjacency(currentGeometry);
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids; triangleBoundRadii = adjData.boundRadii;
+  buildSpatialGrid(triangleCentroids, currentGeometry.attributes.position.count / 3, currentBounds);
 
   // Update edge length for new bounds
-  const maxDim = Math.max(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
-  const defaultEdge = Math.max(0.05, Math.min(5.0, +(maxDim / 200).toFixed(2)));
+  const diag = Math.sqrt(currentBounds.size.x ** 2 + currentBounds.size.y ** 2 + currentBounds.size.z ** 2);
+  const defaultEdge = Math.max(0.05, Math.min(5.0, +(diag / 300).toFixed(2)));
   settings.refineLength = defaultEdge;
   refineLenSlider.value = defaultEdge;
   refineLenVal.value = defaultEdge;
@@ -1318,6 +1509,7 @@ function loadDefaultCube() {
   const adjData = buildAdjacency(geo);
   triangleAdjacency = adjData.adjacency;
   triangleCentroids = adjData.centroids; triangleBoundRadii = adjData.boundRadii;
+  buildSpatialGrid(triangleCentroids, geo.attributes.position.count / 3, currentBounds);
 
   settings.scaleU  = 0.5; scaleUSlider.value = scaleToPos(0.5); scaleUVal.value = 0.5;
   settings.scaleV  = 0.5; scaleVSlider.value = scaleToPos(0.5); scaleVVal.value = 0.5;
@@ -1325,8 +1517,8 @@ function loadDefaultCube() {
   settings.offsetV = 0; offsetVSlider.value = 0; offsetVVal.value = 0;
   triLimitWarning.classList.add('hidden');
 
-  const maxDim = Math.max(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
-  const defaultEdge = Math.max(0.05, Math.min(5.0, +(maxDim / 200).toFixed(2)));
+  const diag = Math.sqrt(currentBounds.size.x ** 2 + currentBounds.size.y ** 2 + currentBounds.size.z ** 2);
+  const defaultEdge = Math.max(0.05, Math.min(5.0, +(diag / 250).toFixed(2)));
   settings.refineLength = defaultEdge;
   refineLenSlider.value = defaultEdge;
   refineLenVal.value = defaultEdge;
@@ -1412,6 +1604,7 @@ async function handleModelFile(file) {
     const adjData = buildAdjacency(geometry);
     triangleAdjacency = adjData.adjacency;
     triangleCentroids = adjData.centroids; triangleBoundRadii = adjData.boundRadii;
+    buildSpatialGrid(triangleCentroids, geometry.attributes.position.count / 3, bounds);
 
     // Reset scale & offset sliders so scale=1 = one tile covers the full bounding box
     const resetVal = (slider, valEl, value) => {
@@ -1424,9 +1617,9 @@ async function handleModelFile(file) {
     settings.offsetV = 0; resetVal(offsetVSlider, offsetVVal, 0);
     triLimitWarning.classList.add('hidden');
 
-    // Default edge length = 1/200 of the largest bounding box dimension
-    const maxDim = Math.max(bounds.size.x, bounds.size.y, bounds.size.z);
-    const defaultEdge = Math.max(0.05, Math.min(5.0, +(maxDim / 200).toFixed(2)));
+    // Default edge length = 1/250 of the bounding box diagonal
+    const diag = Math.sqrt(bounds.size.x ** 2 + bounds.size.y ** 2 + bounds.size.z ** 2);
+    const defaultEdge = Math.max(0.05, Math.min(5.0, +(diag / 250).toFixed(2)));
     settings.refineLength = defaultEdge;
     refineLenSlider.value = defaultEdge;
     refineLenVal.value = defaultEdge;
@@ -1470,7 +1663,11 @@ function updateFaceMask(geometry) {
   if (!geometry) return;
   const posCount = geometry.attributes.position.count;
   const triCount = posCount / 3;
-  const maskArr = new Float32Array(posCount);
+
+  // Reuse existing buffer if length matches exactly, otherwise allocate new
+  const existing = geometry.getAttribute('faceMask');
+  const reuseBuffer = existing && existing.array.length === posCount;
+  const maskArr = reuseBuffer ? existing.array : new Float32Array(posCount);
 
   // Determine which face set to check
   const isPrecision = (geometry === precisionGeometry && precisionMaskingEnabled);
@@ -1494,7 +1691,11 @@ function updateFaceMask(geometry) {
     }
   }
 
-  geometry.setAttribute('faceMask', new THREE.Float32BufferAttribute(maskArr, 1));
+  if (reuseBuffer) {
+    existing.needsUpdate = true;
+  } else {
+    geometry.setAttribute('faceMask', new THREE.Float32BufferAttribute(maskArr, 1));
+  }
 
   // Ensure faceNormal attribute exists (needed by shader for angle masking).
   // For the original geometry normal == faceNormal; for subdivided geometry
@@ -1504,8 +1705,25 @@ function updateFaceMask(geometry) {
     addFaceNormals(geometry);
   }
 
-  // Skip expensive falloff recomputation while actively masking;
-  // it will be recalculated when the masking tool is deactivated.
+  // Ensure falloff attributes exist so the shader doesn't read 0.0 for missing
+  // attributes (which would make totalMask = 0 → entire model appears masked).
+  // This matters when a fresh geometry is displayed while the masking tool is
+  // active (e.g. entering precision mode) because the expensive recomputation
+  // below is intentionally skipped during active masking.
+  if (!geometry.attributes.boundaryFalloffAttr) {
+    const arr = new Float32Array(posCount);
+    arr.fill(1.0);
+    geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(arr, 1));
+  }
+  if (!geometry.attributes.boundaryMaskTypeAttr) {
+    const arr = new Float32Array(posCount);
+    arr.fill(1.0);
+    geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(arr, 1));
+  }
+
+  // Skip expensive per-vertex falloff and boundary edge recomputation while
+  // actively masking; both will be recalculated when the masking tool is
+  // deactivated (in setExclusionTool → updateFaceMask with exclusionTool=null).
   if (!exclusionTool && (_falloffDirty || geometry !== _falloffGeometry)) {
     computeBoundaryFalloffAttr(geometry, maskArr);
     computeBoundaryEdges(geometry, maskArr);
@@ -1513,6 +1731,7 @@ function updateFaceMask(geometry) {
     _falloffGeometry = geometry;
   }
   syncBoundaryEdgeUniforms();
+  requestRender();
 }
 
 /**
@@ -1529,14 +1748,25 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   const posCount = posAttr.count;
   const triCount = posCount / 3;
   const falloff = settings.boundaryFalloff ?? 0;
-  const falloffArr = new Float32Array(posCount);
+
+  // Reuse existing attribute buffers when sizes match to avoid Three.js
+  // WebGL binding state cache issues when replacing attribute objects on
+  // a geometry that is already attached to a rendered mesh.
+  const existingFalloff = geometry.getAttribute('boundaryFalloffAttr');
+  const reuseFalloff = existingFalloff && existingFalloff.array.length === posCount;
+  const falloffArr = reuseFalloff ? existingFalloff.array : new Float32Array(posCount);
   falloffArr.fill(1.0);
 
+  const existingType = geometry.getAttribute('boundaryMaskTypeAttr');
+  const reuseType = existingType && existingType.array.length === posCount;
+  const maskTypeArr = reuseType ? existingType.array : new Float32Array(posCount);
+  maskTypeArr.fill(1.0);
+
   if (falloff <= 0) {
-    geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
-    const defaultType = new Float32Array(posCount);
-    defaultType.fill(1.0);
-    geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(defaultType, 1));
+    if (reuseFalloff) existingFalloff.needsUpdate = true;
+    else geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
+    if (reuseType) existingType.needsUpdate = true;
+    else geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
     return;
   }
 
@@ -1620,10 +1850,10 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   }
 
   if (boundaryPositions.length === 0) {
-    geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
-    const defaultType = new Float32Array(posCount);
-    defaultType.fill(1.0);
-    geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(defaultType, 1));
+    if (reuseFalloff) existingFalloff.needsUpdate = true;
+    else geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
+    if (reuseType) existingType.needsUpdate = true;
+    else geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
     return;
   }
 
@@ -1710,8 +1940,6 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   }
 
   // Write per-vertex attributes
-  const maskTypeArr = new Float32Array(posCount);
-  maskTypeArr.fill(1.0); // default: angle mask (grey)
   for (let i = 0; i < posCount; i++) {
     tmpV.fromBufferAttribute(posAttr, i);
     const k = posKey(tmpV.x, tmpV.y, tmpV.z);
@@ -1719,8 +1947,10 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
     if (maskTypeCache.has(k)) maskTypeArr[i] = maskTypeCache.get(k);
   }
 
-  geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
-  geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
+  if (reuseFalloff) existingFalloff.needsUpdate = true;
+  else geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
+  if (reuseType) existingType.needsUpdate = true;
+  else geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
 }
 
 /**
@@ -1958,8 +2188,16 @@ function buildParentFaceMap(subdivGeo) {
 }
 
 function getEffectiveMapEntry() {
-  if (!activeMapEntry || settings.textureSmoothing === 0) return activeMapEntry;
-  const { fullCanvas, width, height } = activeMapEntry;
+  if (!activeMapEntry || settings.textureSmoothing === 0) {
+    _effectiveMapCache    = null;
+    _effectiveMapCacheKey = null;
+    return activeMapEntry;
+  }
+  const { fullCanvas, width, height, name } = activeMapEntry;
+  const cacheKey = `${name}_${width}_${height}_${settings.textureSmoothing}`;
+  if (_effectiveMapCacheKey === cacheKey && _effectiveMapCache) {
+    return _effectiveMapCache;
+  }
   // Tile the source 3×3 before blurring so edge pixels have correct
   // neighbours and the blurred centre tile is seamlessly tileable.
   const tiled = document.createElement('canvas');
@@ -1984,7 +2222,11 @@ function getEffectiveMapEntry() {
   const imageData = offscreen.getContext('2d').getImageData(0, 0, width, height);
   const texture   = new THREE.CanvasTexture(offscreen);
   texture.wrapS   = texture.wrapT = THREE.RepeatWrapping;
-  return { ...activeMapEntry, imageData, texture };
+  if (_lastEffectiveTexture) _lastEffectiveTexture.dispose();
+  _lastEffectiveTexture = texture;
+  _effectiveMapCache    = { ...activeMapEntry, imageData, texture };
+  _effectiveMapCacheKey = cacheKey;
+  return _effectiveMapCache;
 }
 
 function updatePreview() {
@@ -2074,19 +2316,28 @@ function addFaceNormals(geometry) {
 function addSmoothNormals(geometry) {
   const pos   = geometry.attributes.position.array;
   const count = geometry.attributes.position.count;
+  const nrm   = geometry.attributes.normal.array;
 
+  // Vertex-dedup pass: assign a numeric ID to each unique quantised position.
   const QUANT = 1e4;
-  const key = (x, y, z) =>
-    `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
+  const dedupMap = new Map();
+  let nextId = 0;
+  const vertId = new Uint32Array(count);
+  for (let i = 0; i < count; i++) {
+    const key = `${Math.round(pos[i*3]*QUANT)}_${Math.round(pos[i*3+1]*QUANT)}_${Math.round(pos[i*3+2]*QUANT)}`;
+    let id = dedupMap.get(key);
+    if (id === undefined) { id = nextId++; dedupMap.set(key, id); }
+    vertId[i] = id;
+  }
 
-  // Accumulate area-weighted buffer normals per unique position.
+  // Accumulate area-weighted buffer normals per unique position into flat arrays.
   // The subdivision pipeline splits indexed vertices at sharp dihedral edges
-  // (>30°) so the interpolated buffer normals are smooth across soft edges
+  // (>30 deg) so the interpolated buffer normals are smooth across soft edges
   // (cylinder, sphere) but sharp across hard edges (cube).  Using these buffer
   // normals instead of geometric face normals eliminates visible faceting steps
   // on round surfaces while still preserving hard edges.
-  const nrmMap = new Map();
-  const nrm = geometry.attributes.normal.array;
+  const uc = nextId;
+  const snx = new Float64Array(uc), sny = new Float64Array(uc), snz = new Float64Array(uc);
   const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
   const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
 
@@ -2101,32 +2352,24 @@ function addSmoothNormals(geometry) {
     if (area < 1e-12) continue;
     for (let v = 0; v < 3; v++) {
       const vi = i + v;
-      const nx = nrm[vi * 3], ny = nrm[vi * 3 + 1], nz = nrm[vi * 3 + 2];
-      const k = key(pos[vi * 3], pos[vi * 3 + 1], pos[vi * 3 + 2]);
-      const prev = nrmMap.get(k);
-      if (prev) {
-        prev[0] += nx * area;
-        prev[1] += ny * area;
-        prev[2] += nz * area;
-      } else {
-        nrmMap.set(k, [nx * area, ny * area, nz * area]);
-      }
+      const id = vertId[vi];
+      snx[id] += nrm[vi * 3]     * area;
+      sny[id] += nrm[vi * 3 + 1] * area;
+      snz[id] += nrm[vi * 3 + 2] * area;
     }
   }
 
   // Normalize accumulated normals
-  for (const n of nrmMap.values()) {
-    const len = Math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    if (len > 1e-12) { n[0] /= len; n[1] /= len; n[2] /= len; }
+  for (let id = 0; id < uc; id++) {
+    const len = Math.sqrt(snx[id] * snx[id] + sny[id] * sny[id] + snz[id] * snz[id]) || 1;
+    snx[id] /= len; sny[id] /= len; snz[id] /= len;
   }
 
-  // Write smoothNormal attribute
+  // Write smoothNormal attribute via vertId lookup
   const sn = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
-    const k = key(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
-    const n = nrmMap.get(k);
-    if (n) { sn[i * 3] = n[0]; sn[i * 3 + 1] = n[1]; sn[i * 3 + 2] = n[2]; }
-    else   { sn[i * 3] = 0; sn[i * 3 + 1] = 0; sn[i * 3 + 2] = 1; }
+    const id = vertId[i];
+    sn[i * 3] = snx[id]; sn[i * 3 + 1] = sny[id]; sn[i * 3 + 2] = snz[id];
   }
   geometry.setAttribute('smoothNormal', new THREE.Float32BufferAttribute(sn, 3));
 }
@@ -2182,11 +2425,14 @@ function deactivatePrecisionMasking() {
     triangleCentroids  = precisionCentroids;
     triangleBoundRadii = precisionBoundRadii;
 
+    // Rebuild spatial grid for the promoted base mesh
+    const triCount = currentGeometry.attributes.position.count / 3;
+    buildSpatialGrid(triangleCentroids, triCount, currentBounds);
+
     // Promote precision excluded faces to the base set
     excludedFaces = precisionExcludedFaces;
 
     // Update mesh info display
-    const triCount = getTriangleCount(currentGeometry);
     const mb = ((currentGeometry.attributes.position.array.byteLength) / 1024 / 1024).toFixed(2);
     const sx = currentBounds.size.x.toFixed(2);
     const sy = currentBounds.size.y.toFixed(2);
@@ -2262,6 +2508,10 @@ async function refreshPrecisionMesh() {
     precisionCentroids  = adjData.centroids;
     precisionBoundRadii = adjData.boundRadii;
 
+    // Rebuild spatial grid for the precision mesh so brush queries are fast
+    const precTriCount = precisionGeometry.attributes.position.count / 3;
+    buildSpatialGrid(precisionCentroids, precTriCount, currentBounds);
+
     // Seed precisionExcludedFaces from existing excludedFaces
     precisionExcludedFaces = new Set();
     if (excludedFaces.size > 0) {
@@ -2274,6 +2524,18 @@ async function refreshPrecisionMesh() {
     // Swap display mesh to refined geometry
     setMeshGeometry(precisionGeometry);
     updateFaceMask(precisionGeometry);
+    // Force per-vertex falloff computation on the fresh geometry even though
+    // the masking tool is still active – updateFaceMask only computes boundary
+    // edges during painting; the full vertex-level falloff is deferred until
+    // the tool is deactivated, but we need it now for the initial state.
+    {
+      const maskAttr = precisionGeometry.getAttribute('faceMask');
+      if (maskAttr) {
+        computeBoundaryFalloffAttr(precisionGeometry, maskAttr.array);
+        _falloffDirty = false;
+        _falloffGeometry = precisionGeometry;
+      }
+    }
     if (precisionExcludedFaces.size > 0) refreshExclusionOverlay();
     else setExclusionOverlay(null);
 
@@ -2550,26 +2812,30 @@ async function handleExport() {
 
     // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
     // any vertex that ended up below the original model's bottom layer gets
-    // snapped back up to that Z. Only the Z-value is changed.
+    // snapped back up to that Z. Single pass with selective normal recomputation.
     if (settings.bottomAngleLimit > 0) {
       const bottomZ = currentBounds.min.z;
-      const posArr  = finalGeometry.attributes.position.array;
-      for (let i = 2; i < posArr.length; i += 3) {
-        if (posArr[i] < bottomZ) posArr[i] = bottomZ;
-      }
-      finalGeometry.attributes.position.needsUpdate = true;
-      // Recompute normals via cross product so they always match winding order.
       const pa = finalGeometry.attributes.position.array;
       const na = finalGeometry.attributes.normal ? finalGeometry.attributes.normal.array : new Float32Array(pa.length);
+
       for (let i = 0; i < pa.length; i += 9) {
-        const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
-        const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
-        const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
-        const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
-        na[i]   = na[i+3] = na[i+6] = nx/len;
-        na[i+1] = na[i+4] = na[i+7] = ny/len;
-        na[i+2] = na[i+5] = na[i+8] = nz/len;
+        let dirty = false;
+        if (pa[i+2] < bottomZ) { pa[i+2] = bottomZ; dirty = true; }
+        if (pa[i+5] < bottomZ) { pa[i+5] = bottomZ; dirty = true; }
+        if (pa[i+8] < bottomZ) { pa[i+8] = bottomZ; dirty = true; }
+
+        if (dirty) {
+          const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
+          const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
+          const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+          const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
+          na[i]   = na[i+3] = na[i+6] = nx/len;
+          na[i+1] = na[i+4] = na[i+7] = ny/len;
+          na[i+2] = na[i+5] = na[i+8] = nz/len;
+        }
       }
+
+      finalGeometry.attributes.position.needsUpdate = true;
       if (!finalGeometry.attributes.normal) finalGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(na, 3));
       else finalGeometry.attributes.normal.needsUpdate = true;
     }
