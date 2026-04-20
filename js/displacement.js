@@ -63,12 +63,16 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   // so printed edges remain sharp.
 
   // ── Vertex dedup pass: position → numeric ID via one-time string-map pass ─
+  // idPos{X,Y,Z} are only populated when boundary falloff is enabled, since
+  // they're only consumed by the falloff distance field. Pre-sized to `count`
+  // (upper bound on uniqueCount); read by ID, so extra tail slots stay unused.
+  const needIdPositions = (settings.boundaryFalloff ?? 0) > 0;
   const _dedupMap = new Map();
   let _nextId = 0;
   const vertexId = new Uint32Array(count);
-  const _idPosX = [];
-  const _idPosY = [];
-  const _idPosZ = [];
+  const idPosX = needIdPositions ? new Float64Array(count) : null;
+  const idPosY = needIdPositions ? new Float64Array(count) : null;
+  const idPosZ = needIdPositions ? new Float64Array(count) : null;
   for (let i = 0; i < count; i++) {
     const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
     const key = `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
@@ -76,9 +80,9 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     if (id === undefined) {
       id = _nextId++;
       _dedupMap.set(key, id);
-      _idPosX.push(x);
-      _idPosY.push(y);
-      _idPosZ.push(z);
+      if (needIdPositions) {
+        idPosX[id] = x; idPosY[id] = y; idPosZ[id] = z;
+      }
     }
     vertexId[i] = id;
   }
@@ -200,37 +204,33 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   let falloffArr = null;
 
   if (boundaryFalloff > 0) {
-    // Count boundary positions first, then allocate flat SoA arrays
+    // Collect boundary positions in a single pass, using upper-bound-sized
+    // Float64Arrays and subarray() views to avoid double-iteration over uniqueCount.
+    const bpXFull = new Float64Array(uniqueCount);
+    const bpYFull = new Float64Array(uniqueCount);
+    const bpZFull = new Float64Array(uniqueCount);
     let bpCount = 0;
-    for (let id = 0; id < uniqueCount; id++) {
-      const mfTotal = maskedFracTotal[id];
-      const maskedFrac = mfTotal > 0 ? maskedFracMasked[id] / mfTotal : 0;
-      const isOnExclBoundary = excludedPos && excludedPos[id] === 1;
-      if (isOnExclBoundary || (maskedFrac > 0 && maskedFrac < 1)) bpCount++;
-    }
-    const bpX = new Float64Array(bpCount);
-    const bpY = new Float64Array(bpCount);
-    const bpZ = new Float64Array(bpCount);
-    let bpIdx = 0;
+    let gMinX = Infinity, gMinY = Infinity, gMinZ = Infinity;
+    let gMaxX = -Infinity, gMaxY = -Infinity, gMaxZ = -Infinity;
     for (let id = 0; id < uniqueCount; id++) {
       const mfTotal = maskedFracTotal[id];
       const maskedFrac = mfTotal > 0 ? maskedFracMasked[id] / mfTotal : 0;
       const isOnExclBoundary = excludedPos && excludedPos[id] === 1;
       if (isOnExclBoundary || (maskedFrac > 0 && maskedFrac < 1)) {
-        bpX[bpIdx] = _idPosX[id]; bpY[bpIdx] = _idPosY[id]; bpZ[bpIdx] = _idPosZ[id];
-        bpIdx++;
+        const x = idPosX[id], y = idPosY[id], z = idPosZ[id];
+        bpXFull[bpCount] = x; bpYFull[bpCount] = y; bpZFull[bpCount] = z;
+        if (x < gMinX) gMinX = x; if (x > gMaxX) gMaxX = x;
+        if (y < gMinY) gMinY = y; if (y > gMaxY) gMaxY = y;
+        if (z < gMinZ) gMinZ = z; if (z > gMaxZ) gMaxZ = z;
+        bpCount++;
       }
     }
 
     if (bpCount > 0) {
-      // Build a spatial grid of boundary positions for fast nearest-neighbor lookup
-      let gMinX = Infinity, gMinY = Infinity, gMinZ = Infinity;
-      let gMaxX = -Infinity, gMaxY = -Infinity, gMaxZ = -Infinity;
-      for (let i = 0; i < bpCount; i++) {
-        if (bpX[i] < gMinX) gMinX = bpX[i]; if (bpX[i] > gMaxX) gMaxX = bpX[i];
-        if (bpY[i] < gMinY) gMinY = bpY[i]; if (bpY[i] > gMaxY) gMaxY = bpY[i];
-        if (bpZ[i] < gMinZ) gMinZ = bpZ[i]; if (bpZ[i] > gMaxZ) gMaxZ = bpZ[i];
-      }
+      const bpX = bpXFull.subarray(0, bpCount);
+      const bpY = bpYFull.subarray(0, bpCount);
+      const bpZ = bpZFull.subarray(0, bpCount);
+
       const gPad = boundaryFalloff + 1e-3;
       gMinX -= gPad; gMinY -= gPad; gMinZ -= gPad;
       gMaxX += gPad; gMaxY += gPad; gMaxZ += gPad;
@@ -239,22 +239,38 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
       const gDx = (gMaxX - gMinX) / gRes || 1;
       const gDy = (gMaxY - gMinY) / gRes || 1;
       const gDz = (gMaxZ - gMinZ) / gRes || 1;
+      const invDx = 1 / gDx, invDy = 1 / gDy, invDz = 1 / gDz;
       const gridSize = gRes * gRes * gRes;
-      const bGrid = new Array(gridSize);
-      const bCellKey = (ix, iy, iz) => (ix * gRes + iy) * gRes + iz;
+      const gResMax = gRes - 1;
 
+      // CSR-style spatial grid: cellStart/cellIdx give each cell a contiguous
+      // slice of boundary indices. Replaces per-cell JS arrays with flat typed
+      // arrays — no per-cell allocations, tight inner loop, better prefetching.
+      const cellCount = new Uint32Array(gridSize);
+      const bpCell = new Uint32Array(bpCount);
       for (let i = 0; i < bpCount; i++) {
-        const ix = Math.max(0, Math.min(gRes - 1, Math.floor((bpX[i] - gMinX) / gDx)));
-        const iy = Math.max(0, Math.min(gRes - 1, Math.floor((bpY[i] - gMinY) / gDy)));
-        const iz = Math.max(0, Math.min(gRes - 1, Math.floor((bpZ[i] - gMinZ) / gDz)));
-        const ck = bCellKey(ix, iy, iz);
-        if (bGrid[ck]) bGrid[ck].push(i); else bGrid[ck] = [i];
+        let ix = (bpX[i] - gMinX) * invDx | 0; if (ix < 0) ix = 0; else if (ix > gResMax) ix = gResMax;
+        let iy = (bpY[i] - gMinY) * invDy | 0; if (iy < 0) iy = 0; else if (iy > gResMax) iy = gResMax;
+        let iz = (bpZ[i] - gMinZ) * invDz | 0; if (iz < 0) iz = 0; else if (iz > gResMax) iz = gResMax;
+        const ck = (ix * gRes + iy) * gRes + iz;
+        bpCell[i] = ck;
+        cellCount[ck]++;
+      }
+      const cellStart = new Uint32Array(gridSize + 1);
+      for (let c = 0; c < gridSize; c++) cellStart[c + 1] = cellStart[c] + cellCount[c];
+      const cursor = new Uint32Array(gridSize);
+      const cellIdx = new Uint32Array(bpCount);
+      for (let i = 0; i < bpCount; i++) {
+        const ck = bpCell[i];
+        cellIdx[cellStart[ck] + cursor[ck]++] = i;
       }
 
       // How many grid cells to search in each direction to cover boundaryFalloff distance
-      const searchX = Math.ceil(boundaryFalloff / gDx);
-      const searchY = Math.ceil(boundaryFalloff / gDy);
-      const searchZ = Math.ceil(boundaryFalloff / gDz);
+      const searchX = Math.ceil(boundaryFalloff * invDx);
+      const searchY = Math.ceil(boundaryFalloff * invDy);
+      const searchZ = Math.ceil(boundaryFalloff * invDz);
+      const maxDist2 = boundaryFalloff * boundaryFalloff;
+      const invFalloff = 1 / boundaryFalloff;
 
       falloffArr = new Float64Array(uniqueCount);
       falloffArr.fill(1); // default: full displacement
@@ -265,24 +281,25 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
         // Only compute falloff for fully-textured, non-boundary positions
         if (maskedFrac > 0 || isOnExclBoundary) continue;
 
-        const px = _idPosX[id], py = _idPosY[id], pz = _idPosZ[id];
-        const cix = Math.max(0, Math.min(gRes - 1, Math.floor((px - gMinX) / gDx)));
-        const ciy = Math.max(0, Math.min(gRes - 1, Math.floor((py - gMinY) / gDy)));
-        const ciz = Math.max(0, Math.min(gRes - 1, Math.floor((pz - gMinZ) / gDz)));
+        const px = idPosX[id], py = idPosY[id], pz = idPosZ[id];
+        let cix = (px - gMinX) * invDx | 0; if (cix < 0) cix = 0; else if (cix > gResMax) cix = gResMax;
+        let ciy = (py - gMinY) * invDy | 0; if (ciy < 0) ciy = 0; else if (ciy > gResMax) ciy = gResMax;
+        let ciz = (pz - gMinZ) * invDz | 0; if (ciz < 0) ciz = 0; else if (ciz > gResMax) ciz = gResMax;
 
-        let minDist2 = boundaryFalloff * boundaryFalloff;
-        for (let dix = -searchX; dix <= searchX; dix++) {
-          const nix = cix + dix;
-          if (nix < 0 || nix >= gRes) continue;
-          for (let diy = -searchY; diy <= searchY; diy++) {
-            const niy = ciy + diy;
-            if (niy < 0 || niy >= gRes) continue;
-            for (let diz = -searchZ; diz <= searchZ; diz++) {
-              const niz = ciz + diz;
-              if (niz < 0 || niz >= gRes) continue;
-              const cell = bGrid[bCellKey(nix, niy, niz)];
-              if (!cell) continue;
-              for (const idx of cell) {
+        const nixLo = Math.max(0, cix - searchX), nixHi = Math.min(gResMax, cix + searchX);
+        const niyLo = Math.max(0, ciy - searchY), niyHi = Math.min(gResMax, ciy + searchY);
+        const nizLo = Math.max(0, ciz - searchZ), nizHi = Math.min(gResMax, ciz + searchZ);
+
+        let minDist2 = maxDist2;
+        for (let nix = nixLo; nix <= nixHi; nix++) {
+          const baseX = nix * gRes;
+          for (let niy = niyLo; niy <= niyHi; niy++) {
+            const baseXY = (baseX + niy) * gRes;
+            for (let niz = nizLo; niz <= nizHi; niz++) {
+              const ck = baseXY + niz;
+              const end = cellStart[ck + 1];
+              for (let k = cellStart[ck]; k < end; k++) {
+                const idx = cellIdx[k];
                 const dx = px - bpX[idx], dy = py - bpY[idx], dz = pz - bpZ[idx];
                 const d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 < minDist2) minDist2 = d2;
@@ -290,9 +307,9 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
             }
           }
         }
-        const dist = Math.sqrt(minDist2);
-        const factor = Math.min(1, dist / boundaryFalloff);
-        falloffArr[id] = factor;
+        if (minDist2 < maxDist2) {
+          falloffArr[id] = Math.sqrt(minDist2) * invFalloff;
+        }
       }
     }
   }
