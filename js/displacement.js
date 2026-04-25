@@ -45,8 +45,6 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   const settingsWithAspect = { ...settings, textureAspectU: aspectU, textureAspectV: aspectV };
 
   const QUANT = 1e4;
-  const posKey = (x, y, z) =>
-    `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
 
   // ── WHY GAPS HAPPEN ───────────────────────────────────────────────────────
   // The mesh is non-indexed (unrolled): every triangle has its own copy of
@@ -64,33 +62,60 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   // underlying geometry is still faceted (the subdivision didn't change it),
   // so printed edges remain sharp.
 
+  // ── Vertex dedup pass: position → numeric ID via one-time string-map pass ─
+  // idPos{X,Y,Z} are only populated when boundary falloff is enabled, since
+  // they're only consumed by the falloff distance field. Pre-sized to `count`
+  // (upper bound on uniqueCount); read by ID, so extra tail slots stay unused.
+  const needIdPositions = (settings.boundaryFalloff ?? 0) > 0;
+  const _dedupMap = new Map();
+  let _nextId = 0;
+  const vertexId = new Uint32Array(count);
+  const idPosX = needIdPositions ? new Float64Array(count) : null;
+  const idPosY = needIdPositions ? new Float64Array(count) : null;
+  const idPosZ = needIdPositions ? new Float64Array(count) : null;
+  for (let i = 0; i < count; i++) {
+    const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
+    const key = `${Math.round(x * QUANT)}_${Math.round(y * QUANT)}_${Math.round(z * QUANT)}`;
+    let id = _dedupMap.get(key);
+    if (id === undefined) {
+      id = _nextId++;
+      _dedupMap.set(key, id);
+      if (needIdPositions) {
+        idPosX[id] = x; idPosY[id] = y; idPosZ[id] = z;
+      }
+    }
+    vertexId[i] = id;
+  }
+  const uniqueCount = _nextId;
+
   // ── Pass 1: accumulate area-weighted smooth normals per unique position ───
-  // Map: posKey → [nx, ny, nz] (unnormalised sum)
-  const smoothNrmMap = new Map();
-  // zoneAreaMap: posKey → [xArea, yArea, zArea]  (cubic mapping only)
-  // Tracks the total adjacent face area in each cubic projection zone (X/Y/Z dominant).
-  // Seam-edge vertices that border two zones get a blend proportional to face area,
-  // eliminating the mixed-projection artefact on seam-crossing triangles.
-  const zoneAreaMap = new Map();
-  // maskedFracMap: posKey → [maskedArea, totalArea]
-  // Tracks the fraction of surrounding face area that is masked so boundary
-  // vertices get a smooth displacement blend instead of a hard on/off cutoff.
-  const maskedFracMap = new Map();
+  // Flat arrays indexed by vertex dedup ID (replaces Map<string, ...>)
+  const smoothNrmX = new Float64Array(uniqueCount);
+  const smoothNrmY = new Float64Array(uniqueCount);
+  const smoothNrmZ = new Float64Array(uniqueCount);
+
+  // zoneArea: per-axis face area for cubic mapping (replaces zoneAreaMap)
+  const zoneAreaX = new Float64Array(uniqueCount);
+  const zoneAreaY = new Float64Array(uniqueCount);
+  const zoneAreaZ = new Float64Array(uniqueCount);
+
+  // maskedFrac: [maskedArea, totalArea] per unique vertex (replaces maskedFracMap)
+  const maskedFracMasked = new Float64Array(uniqueCount);
+  const maskedFracTotal  = new Float64Array(uniqueCount);
 
   // Optional per-vertex exclusion weights threaded through by subdivision.js.
   // A face's user-exclusion flag = average of its 3 vertex weights > 0.99.
   const ewAttr = geometry.attributes.excludeWeight || null;
-  // Per-face user-exclusion flag: stored separately from maskedFracMap so that
+  // Per-face user-exclusion flag: stored separately from maskedFrac so that
   // user-excluded faces do NOT bleed reduced displacement into adjacent faces
-  // via shared vertices (maskedFracMap is only for angle-based blending).
+  // via shared vertices (maskedFrac is only for angle-based blending).
   const userExcludedFaces = ewAttr ? new Uint8Array(count / 3) : null;
-  // Positions that belong to at least one user-excluded face.  Any included-face
-  // vertex whose original position is in this set sits on the seam boundary; we
-  // pin it to zero displacement so both sides of the seam end up at the same
-  // final position.  Without this the mesh has an open crack at the mask
-  // boundary, which causes the QEM decimator to treat the excluded patch as an
-  // isolated open-mesh island and collapse it to nothing (missing triangles).
-  const excludedPosSet = ewAttr ? new Set() : null;
+  // Positions that belong to at least one user-excluded face (replaces excludedPosSet).
+  const excludedPos = ewAttr ? new Uint8Array(uniqueCount) : null;
+
+  // Displacement cache: one sample per unique vertex (replaces dispCache Map)
+  const dispCacheVal = new Float64Array(uniqueCount);
+  const dispCacheSet = new Uint8Array(uniqueCount);
 
   for (let t = 0; t < count; t += 3) {
     vA.fromBufferAttribute(posAttr, t);
@@ -141,9 +166,8 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     }
 
     for (let v = 0; v < 3; v++) {
-      tmpPos.fromBufferAttribute(posAttr, t + v);
-      const k = posKey(tmpPos.x, tmpPos.y, tmpPos.z);
-      if (userExcluded && excludedPosSet) excludedPosSet.add(k);
+      const vid = vertexId[t + v];
+      if (userExcluded && excludedPos) excludedPos[vid] = 1;
       // Use the buffer normal (from subdivision) weighted by face area.
       // The subdivision pipeline splits indexed vertices at sharp dihedral
       // edges (>30°), so the interpolated buffer normals are smooth across
@@ -151,44 +175,153 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
       // This eliminates visible faceting steps on round surfaces while still
       // preserving hard edges.
       tmpNrm.fromBufferAttribute(nrmAttr, t + v);
-      const existing = smoothNrmMap.get(k);
-      if (existing) {
-        existing[0] += tmpNrm.x * faceArea;
-        existing[1] += tmpNrm.y * faceArea;
-        existing[2] += tmpNrm.z * faceArea;
-      } else {
-        smoothNrmMap.set(k, [tmpNrm.x * faceArea, tmpNrm.y * faceArea, tmpNrm.z * faceArea]);
-      }
+      smoothNrmX[vid] += tmpNrm.x * faceArea;
+      smoothNrmY[vid] += tmpNrm.y * faceArea;
+      smoothNrmZ[vid] += tmpNrm.z * faceArea;
       if (czX > 1e-12 || czY > 1e-12 || czZ > 1e-12) {
-        const za = zoneAreaMap.get(k);
-        if (za) { za[0] += czX; za[1] += czY; za[2] += czZ; }
-        else { zoneAreaMap.set(k, [czX, czY, czZ]); }
+        zoneAreaX[vid] += czX;
+        zoneAreaY[vid] += czY;
+        zoneAreaZ[vid] += czZ;
       }
-      const mf = maskedFracMap.get(k);
-      if (mf) {
-        if (faceMasked) mf[0] += faceArea;
-        mf[1] += faceArea;
-      } else {
-        maskedFracMap.set(k, [faceMasked ? faceArea : 0, faceArea]);
-      }
+      if (faceMasked) maskedFracMasked[vid] += faceArea;
+      maskedFracTotal[vid] += faceArea;
     }
   }
 
   // Normalise each accumulated normal
-  smoothNrmMap.forEach((n) => {
-    const len = Math.sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]) || 1;
-    n[0] /= len; n[1] /= len; n[2] /= len;
-  });
+  for (let id = 0; id < uniqueCount; id++) {
+    const len = Math.sqrt(smoothNrmX[id]*smoothNrmX[id] + smoothNrmY[id]*smoothNrmY[id] + smoothNrmZ[id]*smoothNrmZ[id]) || 1;
+    smoothNrmX[id] /= len; smoothNrmY[id] /= len; smoothNrmZ[id] /= len;
+  }
+
+  // ── Boundary falloff distance field ──────────────────────────────────────────
+  // When boundaryFalloff > 0, identify boundary positions (vertices adjacent to
+  // both masked and unmasked faces, or on the user-exclusion seam) and compute
+  // the Euclidean distance from every fully-textured vertex to its nearest
+  // boundary position.  The result is falloffArr: Float64Array[uniqueCount]
+  // where 0 means "at the boundary" and 1 means "at or beyond the falloff distance".
+  const boundaryFalloff = settings.boundaryFalloff ?? 0;
+  let falloffArr = null;
+
+  if (boundaryFalloff > 0) {
+    // Collect boundary positions in a single pass, using upper-bound-sized
+    // Float64Arrays and subarray() views to avoid double-iteration over uniqueCount.
+    const bpXFull = new Float64Array(uniqueCount);
+    const bpYFull = new Float64Array(uniqueCount);
+    const bpZFull = new Float64Array(uniqueCount);
+    let bpCount = 0;
+    let gMinX = Infinity, gMinY = Infinity, gMinZ = Infinity;
+    let gMaxX = -Infinity, gMaxY = -Infinity, gMaxZ = -Infinity;
+    for (let id = 0; id < uniqueCount; id++) {
+      const mfTotal = maskedFracTotal[id];
+      const maskedFrac = mfTotal > 0 ? maskedFracMasked[id] / mfTotal : 0;
+      const isOnExclBoundary = excludedPos && excludedPos[id] === 1;
+      if (isOnExclBoundary || (maskedFrac > 0 && maskedFrac < 1)) {
+        const x = idPosX[id], y = idPosY[id], z = idPosZ[id];
+        bpXFull[bpCount] = x; bpYFull[bpCount] = y; bpZFull[bpCount] = z;
+        if (x < gMinX) gMinX = x; if (x > gMaxX) gMaxX = x;
+        if (y < gMinY) gMinY = y; if (y > gMaxY) gMaxY = y;
+        if (z < gMinZ) gMinZ = z; if (z > gMaxZ) gMaxZ = z;
+        bpCount++;
+      }
+    }
+
+    if (bpCount > 0) {
+      const bpX = bpXFull.subarray(0, bpCount);
+      const bpY = bpYFull.subarray(0, bpCount);
+      const bpZ = bpZFull.subarray(0, bpCount);
+
+      const gPad = boundaryFalloff + 1e-3;
+      gMinX -= gPad; gMinY -= gPad; gMinZ -= gPad;
+      gMaxX += gPad; gMaxY += gPad; gMaxZ += gPad;
+
+      const gRes = Math.max(4, Math.min(128, Math.ceil(Math.cbrt(bpCount) * 2)));
+      const gDx = (gMaxX - gMinX) / gRes || 1;
+      const gDy = (gMaxY - gMinY) / gRes || 1;
+      const gDz = (gMaxZ - gMinZ) / gRes || 1;
+      const invDx = 1 / gDx, invDy = 1 / gDy, invDz = 1 / gDz;
+      const gridSize = gRes * gRes * gRes;
+      const gResMax = gRes - 1;
+
+      // CSR-style spatial grid: cellStart/cellIdx give each cell a contiguous
+      // slice of boundary indices. Replaces per-cell JS arrays with flat typed
+      // arrays — no per-cell allocations, tight inner loop, better prefetching.
+      const cellCount = new Uint32Array(gridSize);
+      const bpCell = new Uint32Array(bpCount);
+      for (let i = 0; i < bpCount; i++) {
+        let ix = (bpX[i] - gMinX) * invDx | 0; if (ix < 0) ix = 0; else if (ix > gResMax) ix = gResMax;
+        let iy = (bpY[i] - gMinY) * invDy | 0; if (iy < 0) iy = 0; else if (iy > gResMax) iy = gResMax;
+        let iz = (bpZ[i] - gMinZ) * invDz | 0; if (iz < 0) iz = 0; else if (iz > gResMax) iz = gResMax;
+        const ck = (ix * gRes + iy) * gRes + iz;
+        bpCell[i] = ck;
+        cellCount[ck]++;
+      }
+      const cellStart = new Uint32Array(gridSize + 1);
+      for (let c = 0; c < gridSize; c++) cellStart[c + 1] = cellStart[c] + cellCount[c];
+      const cursor = new Uint32Array(gridSize);
+      const cellIdx = new Uint32Array(bpCount);
+      for (let i = 0; i < bpCount; i++) {
+        const ck = bpCell[i];
+        cellIdx[cellStart[ck] + cursor[ck]++] = i;
+      }
+
+      // How many grid cells to search in each direction to cover boundaryFalloff distance
+      const searchX = Math.ceil(boundaryFalloff * invDx);
+      const searchY = Math.ceil(boundaryFalloff * invDy);
+      const searchZ = Math.ceil(boundaryFalloff * invDz);
+      const maxDist2 = boundaryFalloff * boundaryFalloff;
+      const invFalloff = 1 / boundaryFalloff;
+
+      falloffArr = new Float64Array(uniqueCount);
+      falloffArr.fill(1); // default: full displacement
+      for (let id = 0; id < uniqueCount; id++) {
+        const mfTotal = maskedFracTotal[id];
+        const maskedFrac = mfTotal > 0 ? maskedFracMasked[id] / mfTotal : 0;
+        const isOnExclBoundary = excludedPos && excludedPos[id] === 1;
+        // Only compute falloff for fully-textured, non-boundary positions
+        if (maskedFrac > 0 || isOnExclBoundary) continue;
+
+        const px = idPosX[id], py = idPosY[id], pz = idPosZ[id];
+        let cix = (px - gMinX) * invDx | 0; if (cix < 0) cix = 0; else if (cix > gResMax) cix = gResMax;
+        let ciy = (py - gMinY) * invDy | 0; if (ciy < 0) ciy = 0; else if (ciy > gResMax) ciy = gResMax;
+        let ciz = (pz - gMinZ) * invDz | 0; if (ciz < 0) ciz = 0; else if (ciz > gResMax) ciz = gResMax;
+
+        const nixLo = Math.max(0, cix - searchX), nixHi = Math.min(gResMax, cix + searchX);
+        const niyLo = Math.max(0, ciy - searchY), niyHi = Math.min(gResMax, ciy + searchY);
+        const nizLo = Math.max(0, ciz - searchZ), nizHi = Math.min(gResMax, ciz + searchZ);
+
+        let minDist2 = maxDist2;
+        for (let nix = nixLo; nix <= nixHi; nix++) {
+          const baseX = nix * gRes;
+          for (let niy = niyLo; niy <= niyHi; niy++) {
+            const baseXY = (baseX + niy) * gRes;
+            for (let niz = nizLo; niz <= nizHi; niz++) {
+              const ck = baseXY + niz;
+              const end = cellStart[ck + 1];
+              for (let k = cellStart[ck]; k < end; k++) {
+                const idx = cellIdx[k];
+                const dx = px - bpX[idx], dy = py - bpY[idx], dz = pz - bpZ[idx];
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < minDist2) minDist2 = d2;
+              }
+            }
+          }
+        }
+        if (minDist2 < maxDist2) {
+          falloffArr[id] = Math.sqrt(minDist2) * invFalloff;
+        }
+      }
+    }
+  }
 
   // ── Pass 2: sample displacement texture once per unique position ──────────
-  const dispCache = new Map(); // posKey → grey [0, 1]
 
   for (let i = 0; i < count; i++) {
-    tmpPos.fromBufferAttribute(posAttr, i);
-    const k = posKey(tmpPos.x, tmpPos.y, tmpPos.z);
-    if (dispCache.has(k)) continue;
+    const vid = vertexId[i];
+    if (dispCacheSet[vid]) continue;
+    dispCacheSet[vid] = 1;
 
-    const sn = smoothNrmMap.get(k);
+    tmpPos.fromBufferAttribute(posAttr, i);
 
     // Cubic: zone-area-weighted sampling with a stable per-face dominant axis.
     // Non-seam vertices use their single zone purely; seam-edge vertices that
@@ -201,39 +334,39 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     // top (0,0,1) and bottom (0,0,-1) face normals cancel at shared edge vertices,
     // leaving a horizontal smooth normal.  computeUV would then pick the wrong
     // cubic projection axis, making those faces appear untextured.  The face-
-    // normal-based zoneAreaMap is immune to this because it classifies faces by
-    // their geometric cross-product normal, not the averaged vertex normal.
+    // normal-based zoneArea arrays are immune to this because they classify faces
+    // by their geometric cross-product normal, not the averaged vertex normal.
     if (settings.mappingMode === 6 /* MODE_CUBIC */) {
-      const za = zoneAreaMap.get(k);
-      const total = za ? za[0] + za[1] + za[2] : 0;
+      const zaX = zoneAreaX[vid], zaY = zoneAreaY[vid], zaZ = zoneAreaZ[vid];
+      const total = zaX + zaY + zaZ;
       if (total > 0) {
         const md = Math.max(bounds.size.x, bounds.size.y, bounds.size.z, 1e-6);
         const rotRad = (settings.rotation ?? 0) * Math.PI / 180;
         let grey = 0;
-        if (za[0] > 0) { // X-dominant zone → YZ projection
+        if (zaX > 0) { // X-dominant zone → YZ projection
           let rawU = (tmpPos.y-bounds.min.y)/md;
-          if (sn[0] < 0) rawU = -rawU; // flip U for -X faces
+          if (smoothNrmX[vid] < 0) rawU = -rawU; // flip U for -X faces
           const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (za[0]/total);
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (zaX/total);
         }
-        if (za[1] > 0) { // Y-dominant zone → XZ projection
+        if (zaY > 0) { // Y-dominant zone → XZ projection
           let rawU = (tmpPos.x-bounds.min.x)/md;
-          if (sn[1] > 0) rawU = -rawU; // flip U for +Y faces
+          if (smoothNrmY[vid] > 0) rawU = -rawU; // flip U for +Y faces
           const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (za[1]/total);
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (zaY/total);
         }
-        if (za[2] > 0) { // Z-dominant zone → XY projection
+        if (zaZ > 0) { // Z-dominant zone → XY projection
           let rawU = (tmpPos.x-bounds.min.x)/md;
-          if (sn[2] < 0) rawU = -rawU; // flip U for -Z faces
+          if (smoothNrmZ[vid] < 0) rawU = -rawU; // flip U for -Z faces
           const uv = _cubicUV(rawU, (tmpPos.y-bounds.min.y)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (za[2]/total);
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * (zaZ/total);
         }
-        dispCache.set(k, grey);
+        dispCacheVal[vid] = grey;
         continue;
       }
     }
 
-    tmpNrm.set(sn[0], sn[1], sn[2]);
+    tmpNrm.set(smoothNrmX[vid], smoothNrmY[vid], smoothNrmZ[vid]);
 
     const uvResult = computeUV(tmpPos, tmpNrm, settings.mappingMode, settingsWithAspect, bounds);
     let grey;
@@ -245,7 +378,7 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     } else {
       grey = sampleBilinear(imageData.data, imgWidth, imgHeight, uvResult.u, uvResult.v);
     }
-    dispCache.set(k, grey);
+    dispCacheVal[vid] = grey;
   }
 
   // ── Pass 3: displace every vertex copy by the same vector ─────────────────
@@ -258,9 +391,8 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     tmpPos.fromBufferAttribute(posAttr, i);
     tmpNrm.fromBufferAttribute(nrmAttr, i);
 
-    const k    = posKey(tmpPos.x, tmpPos.y, tmpPos.z);
-    const sn   = smoothNrmMap.get(k);
-    const grey = dispCache.get(k);
+    const vid  = vertexId[i];
+    const grey = dispCacheVal[vid];
 
     // User-excluded faces get zero displacement; only angle-based masking uses
     // the smooth per-vertex blend so neighbours are never unintentionally dimmed.
@@ -268,15 +400,16 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     // Pin included-face vertices that share a position with an excluded face.
     // This seals the open crack at the mask boundary so the mesh stays watertight
     // and the decimator cannot collapse the excluded patch to zero faces.
-    const isSealedBoundary = !isFaceExcluded && excludedPosSet && excludedPosSet.has(k);
-    const mf         = maskedFracMap.get(k) || [0, 1];
-    const maskedFrac = mf[1] > 0 ? mf[0] / mf[1] : 0;
+    const isSealedBoundary = !isFaceExcluded && excludedPos && excludedPos[vid] === 1;
+    const mfTotal = maskedFracTotal[vid];
+    const maskedFrac = mfTotal > 0 ? maskedFracMasked[vid] / mfTotal : 0;
     const centeredGrey = settings.symmetricDisplacement ? (grey - 0.5) : grey;
-    const disp = (isFaceExcluded || isSealedBoundary) ? 0 : (1 - maskedFrac) * centeredGrey * settings.amplitude;
+    const falloffFactor = falloffArr ? falloffArr[vid] : 1.0;
+    const disp = (isFaceExcluded || isSealedBoundary) ? 0 : falloffFactor * (1 - maskedFrac) * centeredGrey * settings.amplitude;
 
-    const newX = tmpPos.x + sn[0] * disp;
-    const newY = tmpPos.y + sn[1] * disp;
-    let   newZ = tmpPos.z + sn[2] * disp;
+    const newX = tmpPos.x + smoothNrmX[vid] * disp;
+    const newY = tmpPos.y + smoothNrmY[vid] * disp;
+    let   newZ = tmpPos.z + smoothNrmZ[vid] * disp;
 
     // Prevent boundary vertices from poking through the masked surface in Z.
     // Only triggers for vertices that are partly masked (maskedFrac > 0) and

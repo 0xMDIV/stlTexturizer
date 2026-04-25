@@ -28,8 +28,8 @@
  *   - Struct-of-arrays typed-array heap avoids per-entry object allocation.
  *   - Numeric edge keys (v_lo * MAX_V + v_hi) replace template strings.
  *   - Vertex deduplication uses a numeric spatial-grid Map instead of strings.
- *   - Link-violation check packs sorted face triple into two Numbers to avoid
- *     string allocation.
+ *   - Link-violation check uses a module-level Set with packed keys for O(1)
+ *     duplicate-face lookup.
  *   - Progress callback fires at most every 512 collapses.
  *
  * @param {THREE.BufferGeometry} geometry        non-indexed input
@@ -46,8 +46,23 @@ const FLIP_DOT_SQ   = FLIP_DOT * FLIP_DOT;
 const CREASE_COS    = 0.5;  // cos 60° — edges sharper than this are treated as creases
 const CREASE_WEIGHT = 1e4;  // quadric penalty weight for crease edges
 
+// Time-based yield: only yield every ~100ms of wall time instead of every N iterations.
+// In foreground tabs setTimeout(0) costs ~4ms; in background tabs it's throttled to ~1s.
+// By yielding based on elapsed time we get ~10 yields per second in foreground (smooth progress)
+// and minimal extra delay in background (~10 yields × 1s = ~10s overhead instead of ~200s).
+let _lastYieldTime = 0;
+function _shouldYield() {
+  const now = performance.now();
+  if (now - _lastYieldTime < 100) return false;
+  _lastYieldTime = now;
+  return true;
+}
+function _yieldFrame() {
+  return new Promise(r => setTimeout(r, 0));
+}
+
+// Module-level Set for hasLinkViolation — avoids per-call heap allocation.
 // Module-level scratch arrays for hasLinkViolation — avoids new Map() per call.
-// Size 128 exceeds the maximum practical vertex valence in any STL mesh.
 const _hlvHi = new Float64Array(512);
 const _hlvLo = new Int32Array(512);
 
@@ -78,17 +93,17 @@ export async function decimate(geometry, targetTriangles, onProgress) {
   let   activeFaces = faceCount;
 
   // Seed min-heap with one entry per unique edge.
-  // Use BigInt keys to handle any vertex count without integer overflow.
+  // Use Number keys when vertCount < 94M (safe integer range), BigInt otherwise.
   const heap     = new SoAHeap(Math.min(faceCount * 3, 1 << 24));
   const seedSeen = new Set();
-  const _vc = BigInt(vertCount);
+  const _useNumericSeed = vertCount < 94_000_000;
   for (let f = 0; f < faceCount; f++) {
     if (faces[f * 3] < 0) continue;
     for (let e = 0; e < 3; e++) {
       const va = faces[f * 3 + e];
       const vb = faces[f * 3 + ((e + 1) % 3)];
       const lo = va < vb ? va : vb, hi = va < vb ? vb : va;
-      const ek = BigInt(lo) * _vc + BigInt(hi);
+      const ek = _useNumericSeed ? lo * vertCount + hi : BigInt(lo) * BigInt(vertCount) + BigInt(hi);
       if (!seedSeen.has(ek)) { seedSeen.add(ek); pushEdge(heap, quadrics, positions, version, va, vb); }
     }
   }
@@ -103,11 +118,11 @@ export async function decimate(geometry, targetTriangles, onProgress) {
     const idx = heap.pop();
     if (idx < 0) break;
 
-    // Yield periodically based on total iterations (including rejections)
-    // to keep the UI responsive.  Critical for flat / low-displacement
-    // surfaces where most collapses are rejected by the safety guards.
-    if ((++iterations & 4095) === 0) {
-      await new Promise(r => setTimeout(r, 0));
+    // Yield based on elapsed wall time (~every 100ms) instead of fixed iteration count.
+    // Drastically reduces overhead in background tabs where setTimeout is throttled to 1s.
+    ++iterations;
+    if (_shouldYield()) {
+      await _yieldFrame();
       if (onProgress) {
         const p = Math.min(1, (initFaces - activeFaces) / toRemove);
         if (p - lastProg > 0.005) { onProgress(p); lastProg = p; }
@@ -128,7 +143,7 @@ export async function decimate(geometry, targetTriangles, onProgress) {
     if (nsh < 2) continue;
 
     // ── Three safety guards ───────────────────────────────────────────────────
-    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2)) continue;          // Guard 2
+    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, vertCount)) continue;          // Guard 2
     if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v1, v2, px, py, pz)) continue; // Guard 3a
     if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v2, v1, px, py, pz)) continue; // Guard 3b
 
@@ -258,10 +273,11 @@ function sharedFaceCount(faces, vfHead, slotFace, slotNext, v1, v2) {
 }
 
 // ── Guard 2: Duplicate-face / pinch prevention ───────────────────────────────
-// Uses module-level scratch arrays (_hlvHi, _hlvLo) instead of new Map()
-// to avoid per-call heap allocation.
+// Uses module-level scratch arrays (_hlvHi, _hlvLo) — zero allocation per call.
+// Linear scan is faster than Set for typical STL vertex valence (5-8).
 
-function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
+function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2, vc) {
+  const MUL = vc < 0x200000 ? 0x200000 : vc + 1;
   let n = 0;
   for (let s = vfHead[v1]; s >= 0; s = slotNext[s]) {
     const f = slotFace[s];
@@ -272,7 +288,7 @@ function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     if (fb > fc) { t = fb; fb = fc; fc = t; }
     if (fa > fb) { t = fa; fa = fb; fb = t; }
-    _hlvHi[n] = fa * 0x200000 + fb;
+    _hlvHi[n] = fa * MUL + fb;
     _hlvLo[n] = fc;
     n++;
   }
@@ -286,7 +302,7 @@ function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     if (fb > fc) { t = fb; fb = fc; fc = t; }
     if (fa > fb) { t = fa; fa = fb; fb = t; }
-    const hi = fa * 0x200000 + fb;
+    const hi = fa * MUL + fb;
     for (let i = 0; i < n; i++) {
       if (_hlvHi[i] === hi && _hlvLo[i] === fc) return true;
     }
@@ -316,9 +332,10 @@ function checkFlipped(positions, vfHead, slotFace, slotNext, faces, vc, vo, npx,
     const ony = ouz*ovx - oux*ovz;
     const onz = oux*ovy - ouy*ovx;
     // New positions (vc replaced by np)
-    const nax = fa===vc ? npx : oax, nay = fa===vc ? npy : oay, naz = fa===vc ? npz : oaz;
-    const nbx = fb===vc ? npx : obx, nby = fb===vc ? npy : oby, nbz = fb===vc ? npz : obz;
-    const ncx = fc===vc ? npx : ocx, ncy = fc===vc ? npy : ocy, ncz = fc===vc ? npz : ocz;
+    let nax, nay, naz, nbx, nby, nbz, ncx, ncy, ncz;
+    if (fa === vc)      { nax = npx; nay = npy; naz = npz; nbx = obx; nby = oby; nbz = obz; ncx = ocx; ncy = ocy; ncz = ocz; }
+    else if (fb === vc) { nax = oax; nay = oay; naz = oaz; nbx = npx; nby = npy; nbz = npz; ncx = ocx; ncy = ocy; ncz = ocz; }
+    else                { nax = oax; nay = oay; naz = oaz; nbx = obx; nby = oby; nbz = obz; ncx = npx; ncy = npy; ncz = npz; }
     // Unnormalized new normal
     const nux = nbx-nax, nuy = nby-nay, nuz = nbz-naz;
     const nvx = ncx-nax, nvy = ncy-nay, nvz = ncz-naz;
@@ -368,18 +385,24 @@ function addCreaseQuadrics(quadrics, positions, faces, faceCount) {
       const va = faces[f * 3 + e];
       const vb = faces[f * 3 + ((e + 1) % 3)];
       const key = va < vb ? va * N + vb : vb * N + va;
-      let arr = edgeToFaces.get(key);
-      if (!arr) { arr = []; edgeToFaces.set(key, arr); }
-      arr.push(f);
+      const existing = edgeToFaces.get(key);
+      if (existing === undefined) {
+        edgeToFaces.set(key, f);
+      } else if (existing >= 0) {
+        edgeToFaces.set(key, -(existing * faceCount + f + 1));
+      } else {
+        edgeToFaces.set(key, 0);
+      }
     }
   }
 
   const sqrtW = Math.sqrt(CREASE_WEIGHT);
 
-  for (const [key, flist] of edgeToFaces) {
-    if (flist.length !== 2) continue; // open boundary or non-manifold — skip
-
-    const f0 = flist[0], f1 = flist[1];
+  for (const [key, val] of edgeToFaces) {
+    if (val >= 0 || val === 0) continue; // nur 1 Face oder >2 Faces -> skip
+    const encoded = -(val + 1);
+    const f0 = Math.floor(encoded / faceCount);
+    const f1 = encoded - f0 * faceCount;
     const v0a = faces[f0*3], v0b = faces[f0*3+1], v0c = faces[f0*3+2];
     const v1a = faces[f1*3], v1b = faces[f1*3+1], v1c = faces[f1*3+2];
 
@@ -482,7 +505,9 @@ function solveQ(q, v1, v2) {
   const b2  = -(q[o1+8] + q[o2+8]);
 
   const det = a00*(a11*a22 - a12*a12) - a01*(a01*a22 - a12*a02) + a02*(a01*a12 - a11*a02);
-  if (Math.abs(det) < 1e-10) return false;
+  const maxEl = Math.max(Math.abs(a00), Math.abs(a01), Math.abs(a02), Math.abs(a11), Math.abs(a12), Math.abs(a22));
+  const threshold = maxEl * maxEl * maxEl * 1e-10;
+  if (Math.abs(det) < Math.max(threshold, 1e-30)) return false;
 
   const inv = 1 / det;
   _s[0] = inv * (b0*(a11*a22 - a12*a12) - a01*(b1*a22 - a12*b2) + a02*(b1*a12 - a11*b2));
@@ -665,38 +690,53 @@ class SoAHeap {
     this._px[dst]   = this._px[src];   this._py[dst]   = this._py[src];   this._pz[dst]   = this._pz[src];
   }
 
-  _swap(a, b) {
-    const tc = this._cost[a], tv1 = this._v1[a], tv2 = this._v2[a];
-    const te1 = this._ver1[a], te2 = this._ver2[a];
-    const tpx = this._px[a], tpy = this._py[a], tpz = this._pz[a];
-    this._cost[a] = this._cost[b]; this._v1[a] = this._v1[b]; this._v2[a] = this._v2[b];
-    this._ver1[a] = this._ver1[b]; this._ver2[a] = this._ver2[b];
-    this._px[a]   = this._px[b];   this._py[a]   = this._py[b];   this._pz[a]   = this._pz[b];
-    this._cost[b] = tc; this._v1[b] = tv1; this._v2[b] = tv2;
-    this._ver1[b] = te1; this._ver2[b] = te2;
-    this._px[b]   = tpx; this._py[b]   = tpy; this._pz[b]   = tpz;
-  }
+  _bubbleUp(idx) {
+    const cost = this._cost[idx];
+    const v1 = this._v1[idx], v2 = this._v2[idx];
+    const ver1 = this._ver1[idx], ver2 = this._ver2[idx];
+    const px = this._px[idx], py = this._py[idx], pz = this._pz[idx];
 
-  _bubbleUp(i) {
-    const cost = this._cost;
-    while (i > 1) {
-      const p = i >> 1;
-      if (cost[p] <= cost[i]) break;
-      this._swap(p, i); i = p;
+    while (idx > 1) {
+      const parent = idx >> 1;
+      if (this._cost[parent] <= cost) break;
+      this._cost[idx] = this._cost[parent];
+      this._v1[idx] = this._v1[parent]; this._v2[idx] = this._v2[parent];
+      this._ver1[idx] = this._ver1[parent]; this._ver2[idx] = this._ver2[parent];
+      this._px[idx] = this._px[parent]; this._py[idx] = this._py[parent]; this._pz[idx] = this._pz[parent];
+      idx = parent;
     }
+    this._cost[idx] = cost;
+    this._v1[idx] = v1; this._v2[idx] = v2;
+    this._ver1[idx] = ver1; this._ver2[idx] = ver2;
+    this._px[idx] = px; this._py[idx] = py; this._pz[idx] = pz;
   }
 
-  _sinkDown(i) {
-    const cost = this._cost;
+  _sinkDown(idx) {
     const n = this._len;
-    for (;;) {
-      let s = i;
-      const l = i << 1, r = l | 1;
-      if (l <= n && cost[l] < cost[s]) s = l;
-      if (r <= n && cost[r] < cost[s]) s = r;
-      if (s === i) break;
-      this._swap(s, i); i = s;
+    const cost = this._cost[idx];
+    const v1 = this._v1[idx], v2 = this._v2[idx];
+    const ver1 = this._ver1[idx], ver2 = this._ver2[idx];
+    const px = this._px[idx], py = this._py[idx], pz = this._pz[idx];
+
+    while (true) {
+      const l = idx << 1, r = l | 1;
+      let child = -1;
+      // Find smallest child that is cheaper than saved element
+      if (l <= n && this._cost[l] < cost) child = l;
+      if (r <= n && this._cost[r] < (child >= 0 ? this._cost[child] : cost)) child = r;
+      if (child < 0) break;
+      // Move child up into hole
+      this._cost[idx] = this._cost[child];
+      this._v1[idx] = this._v1[child]; this._v2[idx] = this._v2[child];
+      this._ver1[idx] = this._ver1[child]; this._ver2[idx] = this._ver2[child];
+      this._px[idx] = this._px[child]; this._py[idx] = this._py[child]; this._pz[idx] = this._pz[child];
+      idx = child;
     }
+    // Place saved element in final hole
+    this._cost[idx] = cost;
+    this._v1[idx] = v1; this._v2[idx] = v2;
+    this._ver1[idx] = ver1; this._ver2[idx] = ver2;
+    this._px[idx] = px; this._py[idx] = py; this._pz[idx] = pz;
   }
 
   _grow() {

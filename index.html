@@ -16,6 +16,7 @@
       if (!prefersDark) document.documentElement.setAttribute('data-theme', 'light');
     })();
   </script>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
   <script type="importmap">
   {
     "imports": {
@@ -25,14 +26,41 @@
     }
   }
   </script>
+  <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js">
 </head>
 <body>
   <header>
     <div class="logo">
       <img src="logo.png" alt="BumpMesh" width="24" height="24" />
-      <span>BumpMesh <small style="opacity:.6;font-weight:400">by CNC Kitchen</small></span>
+      <span>BumpMesh <small style="opacity:.6;font-weight:400">by <a href="https://www.youtube.com/@CNCKitchen" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline">CNC Kitchen</a></small></span>
     </div>
     <div class="header-actions">
+      <div class="project-io">
+        <button id="undo-btn" class="icon-btn" data-i18n-title="header.undo" title="Undo (Ctrl+Z)" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>
+        </button>
+        <button id="redo-btn" class="icon-btn" data-i18n-title="header.redo" title="Redo (Ctrl+Shift+Z)" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5v0A5.5 5.5 0 0 0 9.5 20H13"/></svg>
+        </button>
+        <span class="project-io-gap" aria-hidden="true"></span>
+        <button id="reset-settings-btn" class="icon-btn" data-i18n-title="header.resetSettings" title="Reset settings to defaults">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 9 9 9"/></svg>
+        </button>
+        <span class="project-io-gap" aria-hidden="true"></span>
+        <button id="export-project-btn" class="icon-btn" data-i18n-title="header.exportProject" title="Save project (.bumpmesh)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <input type="file" id="import-project-input" accept=".bumpmesh" hidden />
+        <label for="import-project-input" class="icon-btn" data-i18n-title="header.importProject" title="Load project (.bumpmesh)" role="button" tabindex="0">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </label>
+        <div id="export-dialog" class="export-dialog hidden">
+          <label><input type="checkbox" id="export-settings-chk" checked disabled /> <span data-i18n="header.exportSettingsLabel">Settings</span></label>
+          <label><input type="checkbox" id="export-model-chk" checked /> <span data-i18n="header.exportModelLabel">Model (STL)</span></label>
+          <label id="export-texture-row" class="hidden"><input type="checkbox" id="export-texture-chk" checked /> <span data-i18n="header.exportTextureLabel">Custom texture</span></label>
+          <button id="export-go-btn" class="export-go-btn" data-i18n="header.exportGo">Save</button>
+        </div>
+      </div>
       <div class="lang-seg">
       </div>
       <button id="theme-toggle" class="theme-toggle"
@@ -61,11 +89,22 @@
           <p data-i18n-html="dropHint.text">Drop an <strong>.stl</strong>, <strong>.obj</strong> or <strong>.3mf</strong> file here<br/>or <label for="stl-file-input" class="link-label">click to browse</label></p>
           <input type="file" id="stl-file-input" accept=".stl,.obj,.3mf" hidden />
         </div>
-        <canvas id="viewport"></canvas>
+        <canvas id="viewport" role="img" aria-label="3D model preview"></canvas>
         <div id="brush-cursor"></div>
+        <div id="mesh-diagnostics" class="mesh-diagnostics hidden">
+          <button id="mesh-diag-dismiss" class="mesh-diag-dismiss" aria-label="Dismiss">&times;</button>
+          <div id="mesh-diag-fast" class="mesh-diag-results"></div>
+          <div class="mesh-diag-advanced-row">
+            <button id="mesh-diag-run-btn" class="mesh-diag-run-btn"
+              data-i18n="diag.runAdvanced" data-i18n-title="diag.runAdvancedTitle"
+              title="Check for intersecting and overlapping triangles (may take a moment on large meshes)">Run Advanced Checks</button>
+            <span id="mesh-diag-spinner" class="mesh-diag-spinner hidden"></span>
+          </div>
+          <div id="mesh-diag-advanced" class="mesh-diag-results hidden"></div>
+        </div>
         <div id="store-cta-wrapper">
           <span id="store-cta">
-            <span data-i18n-html="cta.store">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> or donate on <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a></span><button id="store-cta-dismiss" aria-label="Dismiss">&times;</button>
+            <span data-i18n-html="cta.store">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener noreferrer">CNCKitchen.STORE</a> or send a tip via <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer">PayPal</a> / <a href="https://ko-fi.com/cnckitchen" target="_blank" rel="noopener noreferrer">Ko-fi</a></span><button id="store-cta-dismiss" aria-label="Dismiss">&times;</button>
           </span>
         </div>
       </div>
@@ -74,6 +113,10 @@
         <label class="wireframe-toggle">
           <input type="checkbox" id="wireframe-toggle" />
           <span data-i18n="ui.wireframe">Wireframe</span>
+        </label>
+        <label class="wireframe-toggle">
+          <input type="checkbox" id="projection-toggle" />
+          <span data-i18n="ui.perspective">Perspective View</span>
         </label>
 
         <div class="viewport-controls-hint" data-i18n="ui.controlsHint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
@@ -94,7 +137,30 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 3v14m0 0l-5-5m5 5l5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 21h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
             <span data-i18n="ui.placeOnFace">Place on Face</span>
           </button>
+          <button id="rotate-btn" class="place-on-face-btn" data-i18n-title="ui.rotateTitle" title="Manually rotate the model around X, Y, Z axes">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M4 12a8 8 0 0 1 14.5-4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M20 12a8 8 0 0 1-14.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18.5 3v4.5H14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5.5 21v-4.5H10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span data-i18n="ui.rotate">Rotate</span>
+          </button>
         </div>
+        <div id="rotate-controls" class="rotate-controls hidden">
+          <div class="rotate-inputs-row">
+            <div class="rotate-input-group">
+              <label for="rotate-x">X°</label>
+              <input type="number" id="rotate-x" class="val" value="0" step="1" />
+            </div>
+            <div class="rotate-input-group">
+              <label for="rotate-y">Y°</label>
+              <input type="number" id="rotate-y" class="val" value="0" step="1" />
+            </div>
+            <div class="rotate-input-group">
+              <label for="rotate-z">Z°</label>
+              <input type="number" id="rotate-z" class="val" value="0" step="1" />
+            </div>
+            <button id="rotate-apply-btn" class="rotate-apply-btn" data-i18n="ui.rotateApply">Apply</button>
+            <button id="rotate-reset-btn" class="rotate-reset-btn" data-i18n="ui.rotateReset">Reset</button>
+          </div>
+        </div>
+        <p style="margin:.4em 0 0;font-size:.75rem;opacity:.55;text-align:center;" data-i18n="ui.localProcessingNote">All processing runs locally in your browser — no data is uploaded.</p>
       </section>
 
       <!-- Displacement Map -->
@@ -112,11 +178,17 @@
           <span data-i18n="ui.uploadCustomMap">Upload custom map</span>
         </label>
         <input type="file" id="texture-file-input" accept="image/*" hidden />
+        <div id="custom-map-row" class="custom-map-row hidden">
+          <div id="custom-map-swatch" class="preset-swatch custom-map-swatch" role="button" tabindex="0" data-i18n-title="ui.customMap" title="Custom map"></div>
+          <button id="custom-map-remove" class="custom-map-remove" data-i18n-title="ui.removeCustomMap" data-i18n-aria-label="ui.removeCustomMap" title="Remove custom map" aria-label="Remove custom map">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
         <div id="active-map-name" class="active-map-name" data-i18n="ui.noMapSelected">No map selected</div>
         <div class="form-row slider-row">
           <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing ⓘ</label>
           <input type="range" id="texture-smoothing" min="0" max="20" step="any" value="0" />
-          <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" />
+          <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" data-wheel-decimals="1" />
         </div>
       </section>
 
@@ -143,7 +215,7 @@
         <div class="form-row slider-row">
           <label for="seam-band-width" data-i18n="labels.transitionSmoothing" data-i18n-title="tooltips.transitionSmoothing" title="Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.">Transition Smoothing ⓘ</label>
           <input type="range" id="seam-band-width" min="0" max="1" step="0.01" value="0.5" />
-          <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" />
+          <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" data-wheel-decimals="2" />
         </div>
         <div class="form-row slider-row" id="cap-angle-row" style="display:none">
           <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle ⓘ</label>
@@ -156,13 +228,20 @@
       <section class="panel-section">
         <h2 data-i18n="sections.displacement">Displacement</h2>
         <div class="form-row slider-row">
-          <label for="amplitude" data-i18n="labels.amplitude">Amplitude</label>
-          <input type="range" id="amplitude" min="-2" max="2" step="0.01" value="0.5" />
-          <input type="number" class="val" id="amplitude-val" value="0.5" min="-100" max="100" step="0.01" />
+          <label for="amplitude" data-i18n="labels.textureHeight">Texture height (mm)</label>
+          <input type="range" id="amplitude" min="0" max="2" step="0.01" value="0.5" />
+          <input type="number" class="val" id="amplitude-val" value="0.5" min="0" max="100" step="0.01" data-wheel-decimals="2" />
         </div>
-        <div id="amplitude-warning" class="amplitude-warning hidden" data-i18n="warnings.amplitudeOverlap">
-          ⚠ Amplitude exceeds 10% of the smallest model dimension — geometry overlaps may occur in the exported STL.
+        <div class="form-row">
+          <label class="checkbox-label" for="invert-displacement">
+            <input type="checkbox" id="invert-displacement" />
+            <span data-i18n="labels.invertDisplacement">Invert (push in instead of out)</span>
+          </label>
         </div>
+        <div id="amplitude-warning" class="amplitude-warning hidden" data-i18n="warnings.textureHeightOverlap">
+          ⚠ Texture height exceeds 10% of the smallest model dimension — geometry overlaps may occur in the exported STL.
+        </div>
+
         <div class="form-row">
           <label class="checkbox-label" for="symmetric-displacement"
             data-i18n-title="tooltips.symmetricDisplacement"
@@ -223,9 +302,19 @@
         </div>
       </section>
 
-      <!-- Mask Angles -->
+      <!-- Masking -->
       <section class="panel-section">
-        <h2 data-i18n="sections.maskAngles" data-i18n-title="tooltips.maskAngles" title="0° = no masking. Surfaces within this angle of horizontal will not be textured.">Mask Angles ⓘ</h2>
+        <h2 data-i18n="sections.masking">Masking</h2>
+
+        <!-- Boundary Falloff (applies to both angle and surface masking) -->
+        <div class="form-row slider-row">
+          <label for="boundary-falloff" data-i18n="labels.boundaryFalloff" data-i18n-title="tooltips.boundaryFalloff" title="Gradually reduces displacement to zero near masked boundaries, preventing triangle overlap where textured and non-textured regions meet.">Smooth Mask ⓘ</label>
+          <input type="range" id="boundary-falloff" min="0" max="10" step="0.1" value="0" />
+          <input type="number" class="val" id="boundary-falloff-val" value="0" min="0" max="10" step="0.1" data-wheel-decimals="2" />
+        </div>
+
+        <!-- By Angle -->
+        <h3 class="panel-subsection-heading" data-i18n="sections.maskAngles" data-i18n-title="tooltips.maskAngles" title="0° = no masking. Surfaces within this angle of horizontal will not be textured.">By Angle ⓘ</h3>
         <div class="form-row slider-row">
           <label for="bottom-angle-limit" data-i18n="labels.bottomFaces" data-i18n-title="tooltips.bottomFaces" title="Suppress texture on downward-facing surfaces within this angle of horizontal">Bottom faces</label>
           <input type="range" id="bottom-angle-limit" min="0" max="90" step="1" value="5" />
@@ -236,11 +325,9 @@
           <input type="range" id="top-angle-limit" min="0" max="90" step="1" value="0" />
           <input type="number" class="val" id="top-angle-limit-val" value="0" min="0" max="90" step="1" />
         </div>
-      </section>
 
-      <!-- Surface Exclusions -->
-      <section class="panel-section">
-        <h2 id="excl-section-heading" data-i18n="sections.surfaceMasking" data-i18n-title="tooltips.surfaceMasking" title="Mask surfaces to control which areas receive displacement.">Surface Masking ⓘ</h2>
+        <!-- By Surface -->
+        <h3 class="panel-subsection-heading" id="excl-section-heading" data-i18n="sections.surfaceMasking" data-i18n-title="tooltips.surfaceMasking" title="Mask surfaces to control which areas receive displacement.">By Surface ⓘ</h3>
         <p id="excl-hint" class="excl-hint" style="display:none"></p>
 
         <!-- Mode toggle: Exclude / Include Only -->
@@ -295,8 +382,8 @@
 
         <!-- Brush type switcher (shown only when Brush is active) -->
         <div id="excl-brush-type-row" class="form-row hidden">
-          <label data-i18n="labels.type">Type</label>
-          <div class="excl-seg">
+          <span id="excl-brush-type-label" class="form-row-label" data-i18n="labels.type">Type</span>
+          <div class="excl-seg" role="group" aria-labelledby="excl-brush-type-label">
             <button id="excl-brush-single" class="excl-seg-btn active" data-i18n="brushType.single">Single</button>
             <button id="excl-brush-radius-btn" class="excl-seg-btn" data-i18n="brushType.circle">Circle</button>
           </div>
@@ -306,7 +393,7 @@
         <div id="excl-radius-row" class="form-row slider-row hidden">
           <label for="excl-brush-radius-slider" data-i18n="labels.size">Size</label>
           <input type="range" id="excl-brush-radius-slider" min="0.2" max="100" step="0.2" value="10" />
-          <input type="number" class="val" id="excl-brush-radius-val" value="10" min="0.2" max="100" step="0.2" />
+          <input type="number" class="val" id="excl-brush-radius-val" value="10" min="0.2" max="100" step="0.2" data-wheel-decimals="1" />
         </div>
 
         <!-- Bucket threshold (shown when Fill is active) -->
@@ -328,9 +415,12 @@
       <section class="panel-section">
         <h2 data-i18n="sections.export" data-i18n-title="tooltips.export" title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export ⓘ</h2>
         <div class="form-row slider-row">
-          <label for="refine-length" data-i18n="labels.resolution" data-i18n-title="tooltips.resolution" title="Edges longer than this value will be split during export">Resolution</label>
-          <input type="range" id="refine-length" min="0.01" max="5" step="0.01" value="1" />
-          <input type="number" class="val" id="refine-length-val" value="1" min="0.01" max="100" step="0.01" />
+          <label for="refine-length" data-i18n="labels.resolution" data-i18n-title="tooltips.resolution" title="Edges longer than this value will be split during export">Resolution (mm)</label>
+          <input type="range" id="refine-length" min="0.01" max="2" step="0.01" value="1" />
+          <input type="number" class="val" id="refine-length-val" value="1" min="0.01" max="100" step="0.01" data-wheel-decimals="2" />
+        </div>
+        <div id="resolution-warning" class="resolution-warning hidden" data-i18n="warnings.resolutionTooCoarse">
+          ⚠ Resolution is coarser than 1/100 of the model's bounding box diagonal — fine details will be lost. Lower the value for finer results.
         </div>
         <div class="form-row slider-row">
           <label for="max-triangles" data-i18n="labels.outputTriangles" data-i18n-title="tooltips.outputTriangles" title="Mesh is fully subdivided first, then decimated down to this count">Output Triangles</label>
@@ -348,7 +438,10 @@
           </div>
           <span id="export-progress-label" data-i18n="progress.processing">Processing…</span>
         </div>
-        <button id="export-btn" class="export-btn" disabled data-i18n="ui.exportStl">Export STL</button>
+        <div class="export-buttons">
+          <button id="export-btn" class="export-btn" disabled data-i18n="ui.exportStl" data-i18n-title="tooltips.exportStl" title="Widely compatible with all slicers">Export STL</button>
+          <button id="export-3mf-btn" class="export-btn" disabled data-i18n="ui.export3mf" data-i18n-title="tooltips.export3mf" title="Smaller file size — may not be accepted by all slicers">Export 3MF</button>
+        </div>
       </section>
 
       <button id="license-link" class="license-link" data-i18n="license.btn">License &amp; Terms</button>
@@ -369,7 +462,7 @@
         <li data-i18n-html="license.item5"><strong>No support</strong> is provided. The author is under no obligation to fix bugs, answer questions, or update this tool. That said, bug reports and feature requests are always welcome at <a href="mailto:texturizer@cnckitchen.com">texturizer@cnckitchen.com</a>.</li>
         <li data-i18n-html="license.item6">The author shall not be held <strong>liable</strong> for any damages, data loss, or issues arising from the use of this tool.</li>
         <li data-i18n-html="license.item7">Want to license or embed this tool for your own business or website? Contact us at <a href="mailto:contact@cnckitchen.com">contact@cnckitchen.com</a>.</li>
-        <li data-i18n-html="license.item3">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">CNCKitchen.STORE</a> or donate on <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener">PayPal</a>.</li>
+        <li data-i18n-html="license.item3">Support this tool? Shop at <a href="https://geni.us/CNCStoreTexture" target="_blank" rel="noopener">CNCKitchen.STORE</a> or send a tip via <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener">PayPal</a> / <a href="https://ko-fi.com/cnckitchen" target="_blank" rel="noopener">Ko-fi</a>.</li>
         <li data-i18n-html="license.item8">Source code available on <a href="https://github.com/CNCKitchen/stlTexturizer" target="_blank" rel="noopener">GitHub</a>.</li>
       </ul>
     </div>
@@ -392,7 +485,7 @@
         <li data-i18n-html="imprint.privacyHosting">This website is hosted on <strong>GitHub Pages</strong> (GitHub Inc. / Microsoft Corp., 88 Colin P Kelly Jr St, San Francisco, CA 94107, USA). When you visit this site, GitHub may process your IP address in server logs. Legal basis: Art. 6(1)(f) DSGVO (legitimate interest in providing the website). See <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement" target="_blank" rel="noopener">GitHub&rsquo;s Privacy Statement</a>.</li>
         <li data-i18n-html="imprint.privacyLocal">This tool stores user preferences (language, theme) in your browser&rsquo;s <strong>localStorage</strong>. This data never leaves your device and is not transmitted to any server.</li>
         <li data-i18n-html="imprint.privacyNoCookies">This website does <strong>not</strong> use cookies, analytics, or any tracking technologies.</li>
-        <li data-i18n-html="imprint.privacyExternal">This site contains links to external websites (e.g., CNCKitchen.STORE, PayPal). These sites have their own privacy policies, over which we have no control.</li>
+        <li data-i18n-html="imprint.privacyExternal">This site contains links to external websites (e.g., CNCKitchen.STORE, PayPal, Ko-fi). These sites have their own privacy policies, over which we have no control.</li>
         <li data-i18n-html="imprint.privacyRights">Under the GDPR you have the right to <strong>access, rectification, erasure, restriction of processing, data portability</strong>, and the right to <strong>lodge a complaint</strong> with a supervisory authority.</li>
       </ul>
     </div>
@@ -408,7 +501,10 @@
         🛒 Visit CNCKitchen.STORE
       </a>
       <a href="https://www.paypal.me/CNCKitchen" target="_blank" rel="noopener noreferrer" class="sponsor-link sponsor-link--paypal" data-i18n="sponsor.donate">
-        💙 Donate on PayPal
+        💙 Send a tip on PayPal
+      </a>
+      <a href="https://ko-fi.com/cnckitchen" target="_blank" rel="noopener noreferrer" class="sponsor-link sponsor-link--kofi" data-i18n="sponsor.donateKofi">
+        ☕ Send a tip on Ko-fi
       </a>
       <label class="sponsor-no-show">
         <input type="checkbox" id="sponsor-dont-show" />
